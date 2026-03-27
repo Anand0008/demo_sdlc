@@ -7,45 +7,39 @@ Implement X-Request-ID middleware for end-to-end request tracing in FastAPI appl
 
 ## Implementation Plan
 
-**Step 1: Install required dependencies**  
-Ensure uuid and structlog are available in the project. If not, install via pip.
+**Step 1: Install Required Dependencies**  
+Ensure structlog and uuid are available. Verify FastAPI and Starlette are installed.
 Files: `requirements.txt`
 
 **Step 2: Create RequestIDMiddleware**  
 Implement RequestIDMiddleware in middleware/request_id.py using Starlette's BaseHTTPMiddleware. Implement UUID validation and generation logic.
 Files: `middleware/request_id.py`
 
-**Step 3: Implement UUID validation**  
-Create a regex-based validator for UUID v4 matching the Confluence specification. Use re.match() to validate incoming X-Request-ID header.
+**Step 3: Implement UUID Validation**  
+Create a utility function to validate UUID v4 using the specified regex pattern. Handle cases of missing or invalid X-Request-ID header.
 Files: `middleware/request_id.py`
 
-**Step 4: Configure structlog context**  
-Bind request_id to structlog context within middleware to ensure all log lines include trace identifier.
+**Step 4: Configure Structlog Context**  
+Bind request_id to structlog context to ensure all log lines include the trace identifier during the request lifecycle.
 Files: `middleware/request_id.py`
 
-**Step 5: Register middleware in main application**  
-Add middleware registration in main.py using app.add_middleware(RequestIDMiddleware)
+**Step 5: Register Middleware in Main Application**  
+Add RequestIDMiddleware to the FastAPI application in main.py using app.add_middleware() method.
 Files: `main.py`
 
-**Step 6: Create unit tests**  
-Develop pytest tests covering UUID generation and passthrough scenarios in middleware/test_request_id.py
-Files: `middleware/test_request_id.py`
+**Step 6: Create Unit Tests**  
+Develop comprehensive unit tests covering UUID generation, header passthrough, and log context injection scenarios.
+Files: `tests/test_request_id_middleware.py`
 
 **Risk Level:** MEDIUM — Low risk implementation that adds observability without changing existing application logic. Middleware is non-invasive and follows established tracing standards.
-
-**Deployment Notes:**
-- No database schema changes
-- No breaking API changes
-- Minimal performance overhead
 
 ## Test Suggestions
 
 Framework: `pytest`
 
 - **test_request_id_auto_generated_when_not_provided** — Verify that a UUID4 is generated when no X-Request-ID header is present
-- **test_request_id_passthrough_when_provided** — Verify that a provided X-Request-ID is echoed back exactly
-- **test_request_id_invalid_header_generates_new_uuid** *(edge case)* — Verify that an invalid X-Request-ID header triggers UUID generation
-- **test_request_id_logged_in_request_context** — Verify that log lines contain the request_id during request processing
+- **test_request_id_passthrough_when_provided** — Verify that a provided X-Request-ID header is echoed back exactly
+- **test_request_id_invalid_header_generates_new_uuid** *(edge case)* — Verify that an invalid X-Request-ID header results in a new UUID4
 
 ## Confluence Documentation References
 

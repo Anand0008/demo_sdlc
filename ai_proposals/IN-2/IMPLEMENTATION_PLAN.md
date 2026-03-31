@@ -3,61 +3,62 @@
 **Jira Ticket:** [IN-2](https://anandinfinity0007.atlassian.net/browse/IN-2)
 
 ## Summary
-Implement async welcome email for new user registration with robust error handling and non-blocking dispatch
+Implement async welcome email functionality for new user registrations
 
 ## Implementation Plan
 
 **Step 1: Create SMTP Configuration Helper**  
-Extend config/settings.py to include SMTP configuration retrieval method. Ensure all required SMTP settings are available as environment variables.
+Add SMTP configuration retrieval method in config/settings.py to centralize SMTP settings access
 Files: `config/settings.py`
 
 **Step 2: Implement Welcome Email Module**  
-Create notifications/welcome_email.py with async send_welcome_email() function. Implement multipart email generation with HTML and plain text alternatives using the Confluence template guidelines.
+Create notifications/welcome_email.py with async send_welcome_email() function. Implement multipart email generation with HTML and plain text alternatives, using Jinja2 for template rendering
 Files: `notifications/welcome_email.py`, `notifications/__init__.py`
 
-**Step 3: Add Email Sending Logic**  
-Implement async email sending using aiosmtplib. Include error handling to log warnings without blocking registration. Use structlog for consistent logging.
-Files: `notifications/welcome_email.py`
-
-**Step 4: Modify Registration Flow**  
-Update auth/jwt_handler.py to call send_welcome_email() using asyncio.create_task() after successful token generation. Ensure the email dispatch does not block the registration response.
+**Step 3: Modify JWT Handler for Email Dispatch**  
+Update auth/jwt_handler.py to call send_welcome_email() using asyncio.create_task() after successful token generation. Ensure non-blocking behavior and error logging
 Files: `auth/jwt_handler.py`
 
-**Step 5: Implement Unit Tests**  
-Create comprehensive unit tests in tests/notifications/ covering happy path email queuing and SMTP failure scenarios. Verify non-blocking behavior and logging.
-Files: `tests/notifications/test_welcome_email.py`
+**Step 4: Implement Error Handling and Logging**  
+Add structured logging for SMTP send failures using structlog. Ensure registration process continues even if email dispatch fails
+Files: `notifications/welcome_email.py`
 
-**Risk Level:** MEDIUM — Medium risk due to introducing new async email functionality and potential SMTP integration complexities. Careful error handling and logging are crucial to prevent registration flow disruption.
+**Step 5: Create Unit Tests**  
+Develop comprehensive unit tests in tests/test_welcome_email.py covering happy path and SMTP failure scenarios
+Files: `tests/test_welcome_email.py`
+
+**Risk Level:** MEDIUM — Low risk implementation with clear requirements and minimal system impact. The email sending is non-blocking and will not affect the core registration flow.
 
 **Deployment Notes:**
-- Ensure SMTP environment variables are correctly configured in all deployment environments
-- Verify email template rendering across different email clients
-- Monitor email delivery rates and potential SMTP connection issues in initial rollout
+- Verify SMTP configuration in staging environment
+- Ensure FRONTEND_URL environment variable is correctly set
+- Test email delivery across different email providers
 
 ## Test Suggestions
 
 Framework: `pytest`
 
-- **test_send_welcome_email_successful_dispatch** — Verify successful welcome email dispatch for a new user
+- **test_send_welcome_email_happy_path** — Verify successful welcome email dispatch for a new user
 - **test_welcome_email_subject_formatting** — Ensure email subject is correctly formatted with user's first name
-- **test_welcome_email_contains_frontend_url_cta** — Verify email body contains CTA link to frontend URL
-- **test_registration_succeeds_when_smtp_fails** *(edge case)* — Ensure user registration completes even if email dispatch fails
-- **test_welcome_email_dispatch_timeout** — Verify email is dispatched within 2 seconds
+- **test_welcome_email_cta_link** — Verify CTA link in email body points to correct frontend URL
+- **test_registration_succeeds_on_smtp_failure** *(edge case)* — Ensure user registration completes even if email sending fails
+- **test_welcome_email_dispatch_timeout** — Verify email is sent within 2 seconds
 
 ## Confluence Documentation References
 
-- [Transactional Email Design - Welcome Flow](https://anandinfinity0007.atlassian.net/wiki/spaces/INF/pages/1605634) — Directly provides the email design specifications for the welcome email, including template structure, dispatch method, and key requirements matching the ticket's goals
+- [Database Schema and Migrations](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1474577) — Provides context for user registration data model, which is relevant to the welcome email implementation
 
 **Suggested Documentation Updates:**
 
 - Transactional Email Design - Welcome Flow
+- Authentication Workflow Documentation
 
 ## AI Confidence Scores
-Plan: 85%, Code: 90%, Tests: 90%
+Plan: 90%, Code: 90%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review
 > before merging. Verify all logic, test coverage, and edge cases independently.**
 >
-> _Generated by [AI Agentic SDLC Assistant](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
+> _Generated by [Artoo](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
 > _© 2025-2026 Telomere LLC. All rights reserved._

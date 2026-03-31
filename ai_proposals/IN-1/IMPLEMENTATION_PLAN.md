@@ -3,58 +3,72 @@
 **Jira Ticket:** [IN-1](https://anandinfinity0007.atlassian.net/browse/IN-1)
 
 ## Summary
-Implement login attempt throttling with Redis-backed counter to prevent brute-force attacks
+Implement login attempt protection with Redis-backed account lockout after 5 consecutive failed attempts
 
 ## Implementation Plan
 
-**Step 1: Create LoginGuard class in login_guard.py**  
-Implement Redis-backed login attempt tracking with methods for recording failures, checking lockout status, and resetting counters
+**Step 1: Create LoginGuard Redis Connection**  
+Set up Redis connection in login_guard.py with fail-open strategy. Implement connection error handling to allow login if Redis is unavailable.
 Files: `auth/login_guard.py`
 
-**Step 2: Implement Redis connection and error handling**  
-Set up Redis connection with fail-open approach. Create methods to handle Redis connection failures gracefully
+**Step 2: Implement LoginGuard.record_failure()**  
+Create method to increment Redis counter for failed login attempts. Use key format 'login:fail:{username}' with 900-second TTL. Ensure atomic increment and TTL reset.
 Files: `auth/login_guard.py`
 
-**Step 3: Modify JWT handler to integrate LoginGuard**  
-Update login endpoint to check account lockout status before password verification. Add reset on successful login
+**Step 3: Implement LoginGuard.is_locked()**  
+Create method to check if login attempts exceed 5. Return tuple with (is_locked, remaining_ttl). Use Redis TTL to calculate remaining lockout time.
+Files: `auth/login_guard.py`
+
+**Step 4: Implement LoginGuard.reset()**  
+Create method to delete Redis key for a username after successful login, clearing previous failure attempts.
+Files: `auth/login_guard.py`
+
+**Step 5: Modify JWT Login Endpoint**  
+Update jwt_handler.py to call LoginGuard.is_locked() before password verification. Return HTTP 423 with retry_after_seconds if locked.
 Files: `auth/jwt_handler.py`
 
-**Step 4: Create unit tests for LoginGuard**  
-Develop comprehensive test cases covering lockout scenarios, reset functionality, and Redis failure handling
+**Step 6: Implement Fail-Open Redis Error Handling**  
+Add try-except block in LoginGuard methods to catch Redis connection errors. Log the error and allow login to proceed.
+Files: `auth/login_guard.py`
+
+**Step 7: Create Unit Tests**  
+Develop comprehensive test cases in test_login_guard.py covering: lockout at 5 attempts, blocking at 6th attempt, reset on successful login, and fail-open Redis scenario.
 Files: `tests/test_login_guard.py`
 
-**Risk Level:** MEDIUM — Medium risk due to security-critical feature involving authentication logic and external Redis dependency. Potential for introducing authentication bypass or performance issues if not implemented carefully.
+**Risk Level:** MEDIUM — Medium risk due to security-critical feature involving authentication logic and external Redis dependency. Potential for introducing authentication bypass or unexpected lockout behavior.
 
 **Deployment Notes:**
-- Ensure Redis connection parameters are correctly configured
-- Verify Redis is running and accessible in all deployment environments
-- Update monitoring to track login attempt failures
+- Ensure Redis is configured and accessible
+- Update monitoring to track login lockout events
+- Communicate new lockout behavior to support team
 
 ## Test Suggestions
 
 Framework: `pytest`
 
-- **test_login_attempts_increment_counter** — Verify login attempt counter increments correctly
-- **test_account_locks_after_five_failed_attempts** *(edge case)* — Verify account locks after 5 consecutive failed attempts
-- **test_lockout_retry_after_seconds** *(edge case)* — Verify retry-after seconds are correctly returned in 423 response
-- **test_successful_login_resets_attempt_counter** — Verify successful login resets failed attempt counter
+- **test_account_locks_after_five_consecutive_failed_attempts** — Verify account is locked after 5 consecutive failed login attempts
+- **test_locked_account_returns_retry_after_seconds** — Verify locked account response includes retry-after seconds
+- **test_successful_login_resets_failure_counter** — Verify successful login resets consecutive failure count
 - **test_account_unlocks_after_fifteen_minutes** *(edge case)* — Verify account automatically unlocks after 15 minutes
-- **test_login_proceeds_when_redis_unavailable** *(edge case)* — Verify login proceeds normally when Redis is down
+- **test_login_proceeds_when_redis_is_unavailable** *(edge case)* — Verify login works normally if Redis is down
+- **test_immediate_lockout_on_sixth_attempt** *(edge case)* — Verify account is locked immediately on 6th attempt
 
 ## Confluence Documentation References
 
-- [Authentication Security Standards - Brute Force Protection](https://anandinfinity0007.atlassian.net/wiki/spaces/INF/pages/2260994) — Directly describes the brute-force protection policy that matches the ticket's requirements, including 5 failed attempts, 15-minute lockout, and per-username tracking
+- [Security and Authentication Guidelines](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1507329) — Provides context for authentication mechanisms and security standards relevant to the login protection implementation
+- [API Design Standards](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1474561) — Provides precedent for rate limiting and Redis-based protection mechanisms, which aligns with the ticket's brute-force protection requirements
 
 **Suggested Documentation Updates:**
 
-- Authentication Security Standards - Brute Force Protection
+- Security and Authentication Guidelines
+- Add section describing login attempt throttling mechanism and LoginGuard implementation details
 
 ## AI Confidence Scores
-Plan: 90%, Code: 90%, Tests: 90%
+Plan: 85%, Code: 90%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review
 > before merging. Verify all logic, test coverage, and edge cases independently.**
 >
-> _Generated by [AI Agentic SDLC Assistant](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
+> _Generated by [Artoo](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
 > _© 2025-2026 Telomere LLC. All rights reserved._

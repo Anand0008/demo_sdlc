@@ -11,43 +11,43 @@ Implement JWT-based user authentication for Todo API with user registration, log
 Implement User model in SQLAlchemy with email, hashed password, and relationship to todos
 Files: `models/user.py`, `models/todo.py`
 
-**Step 2: Implement Password Utility Functions**  
-Create utility functions for password hashing and validation using bcrypt with cost factor 12
+**Step 2: Implement Password Hashing Utility**  
+Create utility functions for password hashing and verification using bcrypt with cost factor 12
 Files: `utils/security.py`
 
-**Step 3: Develop JWT Token Generation**  
-Implement JWT token generation using RS256, including user_id, token type, and jti in payload with 15-minute expiration
-Files: `utils/jwt_handler.py`
+**Step 3: Develop JWT Token Management**  
+Implement JWT token generation and validation using RS256, including payload with user_id, token type, and unique token ID
+Files: `utils/jwt_manager.py`
 
 **Step 4: Create Authentication Endpoints**  
-Implement /auth/register and /auth/login endpoints with password validation and token generation
+Implement /api/v1/auth/register and /api/v1/auth/login endpoints with proper validation and error handling
 Files: `routes/auth.py`
 
-**Step 5: Implement Authentication Middleware**  
-Create JWT token validation middleware to protect /todos endpoints, ensuring user-scoped access
-Files: `middleware/auth.py`, `routes/todos.py`
-
-**Step 6: Modify Todo Endpoints**  
-Update todo CRUD operations to filter and restrict access based on authenticated user's ID
+**Step 5: Update Todo Endpoints**  
+Modify existing todo endpoints to require JWT authentication and filter todos by owner_id
 Files: `routes/todos.py`, `services/todo_service.py`
 
+**Step 6: Implement Authentication Middleware**  
+Create middleware to validate JWT tokens for protected routes and extract user context
+Files: `middleware/auth_middleware.py`
+
 **Step 7: Database Migration**  
-Create and run database migration to add user table and owner_id foreign key to todos
-Files: `migrations/versions/xxx_add_user_and_owner.py`
+Create database migration to add User table and owner_id to existing todos
+Files: `migrations/versions/auth_migration.py`
 
-**Step 8: Implement Error Handling**  
-Add comprehensive error handling for authentication failures, invalid tokens, and unauthorized access
-Files: `exceptions.py`, `middleware/auth.py`
+**Step 8: Implement Input Validation**  
+Add password complexity validation for registration, ensuring minimum requirements are met
+Files: `utils/validators.py`
 
-**Risk Level:** MEDIUM — Medium risk due to security-critical changes involving authentication, database schema modifications, and endpoint protection. Potential for introducing security vulnerabilities if not implemented carefully.
+**Risk Level:** MEDIUM — Medium risk due to security-critical changes involving authentication, database schema modifications, and introducing new access control mechanisms
 ⚠️ **Breaking Changes: YES**
 ⚠️ **Database Migrations Required: YES**
 
 **Deployment Notes:**
-- Require database migration
-- Update environment variables for JWT secret
-- Restart API services
-- Invalidate existing tokens
+- Migrate existing todo data
+- Update API documentation
+- Rotate JWT signing keys
+- Update client applications to include authentication
 
 ## Test Suggestions
 
@@ -58,14 +58,14 @@ Framework: `pytest`
 - **test_user_login_successful** — Verify successful user login generates valid JWT token
 - **test_user_login_invalid_credentials** *(edge case)* — Verify login fails with incorrect credentials
 - **test_jwt_token_validation** — Validate JWT token generation and verification
-- **test_todo_access_with_valid_token** — Verify user can access only their own todos with valid token
+- **test_todo_access_with_valid_token** — Verify user can only access their own todos
 - **test_todo_access_with_invalid_token** *(edge case)* — Prevent todo access with invalid or expired token
 
 ## Confluence Documentation References
 
-- [Security and Authentication Guidelines](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1507329) — Directly relevant to the ticket's authentication requirements, providing specific guidelines for JWT token generation, password hashing, and security standards
-- [API Design Standards](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1474561) — Provides guidance on API endpoint design and appropriate HTTP status codes, which is relevant to the authentication implementation
-- [System Architecture Overview](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1409025) — Confirms the platform's use of JWT authentication and provides context for the authentication service structure
+- [Security and Authentication Guidelines](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1507329) — Directly provides JWT authentication and password hashing guidelines that are crucial for implementing the ticket's authentication requirements
+- [API Design Standards](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1474561) — Provides guidance on API endpoint design and HTTP status codes, which is relevant for implementing the new authentication endpoints
+- [System Architecture Overview](https://anandinfinity0007.atlassian.net/wiki/spaces/SD/pages/1409025) — Confirms the platform's use of FastAPI, SQLAlchemy, and JWT authentication, which aligns with the ticket's implementation requirements
 
 **Suggested Documentation Updates:**
 
@@ -73,7 +73,7 @@ Framework: `pytest`
 - API Design Standards
 
 ## AI Confidence Scores
-Plan: 85%, Code: 90%, Tests: 90%
+Plan: 90%, Code: 90%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

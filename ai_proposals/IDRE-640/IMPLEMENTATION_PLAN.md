@@ -1,0 +1,92 @@
+## IDRE-640: Organization Mismatch: Include Emails
+
+**Jira Ticket:** [IDRE-640](https://orchidsoftware.atlassian.net//browse/IDRE-640)
+
+## Summary
+Update the organization wizard step to display party and organization emails, including a tooltip for multiple organization emails.
+
+## Implementation Plan
+
+**Step 1: Display NIP/IP Party Email**  
+Update the `NipOrganizationStep` component to display the `partyEmail` (or `originalPartyEmail`) below the NIP/IP Party Name. Add a new UI element (e.g., a small text span or badge) below the party name displaying this email.
+Files: `components/case-review/party-wizard-step-organization.tsx`
+
+**Step 2: Implement Organization Emails Tooltip Logic**  
+Create a helper component or function to render organization emails. If the organization's email string contains multiple emails (e.g., comma-separated), display the first one and use a Tooltip component from `@/components/ui/tooltip` to show the full list on hover. If there's only one, just display it.
+Files: `components/case-review/party-wizard-step-organization.tsx`
+
+**Step 3: Display Emails for Current IP/NIP Org**  
+Integrate the new email tooltip logic below the 'Current IP/NIP Org' display. Find the organization in `availableOrganizations` matching `originalOrganization.id` to get its emails, and render them below the organization name.
+Files: `components/case-review/party-wizard-step-organization.tsx`
+
+**Step 4: Display Emails for Suggested IP/NIP Org**  
+Integrate the new email tooltip logic below the 'Current IP/NIP Suggested Org' (or the selected/new organization) display. Find the organization in `availableOrganizations` matching `currentOrganization.id` to get its emails, and render them below the suggested organization name.
+Files: `components/case-review/party-wizard-step-organization.tsx`
+
+**Risk Level:** LOW — The changes are purely UI additions within a single wizard step component, utilizing existing props and data structures. No backend or state management changes are required.
+
+## Proposed Code Changes
+
+### `components/case-review/party-wizard-step-organization.tsx` (modify)
+No rationale provided
+```
+Type: modify
+
+```diff
+--- a/components/case-review/party-wizard-step-organization.tsx
++++ b/components/case-review/party-wizard-step-organization.tsx
+@@ -14,6 +14,12 @@
+   Check,
+   X,
+ } from "lucide-react";
++import {
++  Tooltip,
++  TooltipContent,
++  TooltipProvider,
++  TooltipTrigger,
++} from "@/components/ui/tooltip";
+ import { cn } from "@/lib/utils";
+ import { toast } from "sonner";
+ import { createOrganizationDuringReview } from "@/lib/actions/case-review";
+@@ -46,6 +52,42 @@
+   onPartyEmailChange: (email: string) => void;
+ }
+ 
++function OrgEmailsDisplay({ emails }: { emails?: string | null }) {
++  if (!emails) return null;
++  
++  const emailList = emails.split(',').map(e => e.trim()).filter(Boolean);
++  if (emailList.length === 0) return null;
++  
++  if (emailList.length
+```
+
+## Test Suggestions
+
+Framework: `Vitest with React Testing Library`
+
+- **shouldRenderPartyEmailBelowPartyName** — Verifies that the NIP/IP Party Email from the notice of initiation is displayed correctly.
+- **shouldRenderSingleOrganizationEmailWithoutTooltip** — Verifies that a single organization email is displayed directly without requiring a tooltip.
+- **shouldRenderTooltipForMultipleOrganizationEmails** — Verifies that multiple organization emails are hidden behind a tooltip that reveals them on hover.
+- **shouldRenderTooltipForMultipleSuggestedOrganizationEmails** — Verifies that multiple suggested organization emails are displayed correctly within a tooltip.
+- **shouldHandleMissingEmailsGracefully** *(edge case)* — Ensures the component handles missing email data gracefully without throwing errors.
+
+## Confluence Documentation References
+
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document for the Organization Management System, which governs the Organization Mismatch view being modified. It contains the baseline requirements and UI designs that need to be updated to include the new email fields and tooltip behavior.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This document provides an overview of the Organization Management tools. It likely contains current screenshots and descriptions of the Organization Mismatch UI that will change as a result of this ticket.
+
+**Suggested Documentation Updates:**
+
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview
+
+## AI Confidence Scores
+Plan: 90%, Code: 95%, Tests: 90%
+
+---
+> ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review
+> before merging. Verify all logic, test coverage, and edge cases independently.**
+>
+> _Generated by [Artoo](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
+> _© 2025-2026 Telomere LLC. All rights reserved._

@@ -3,33 +3,32 @@
 **Jira Ticket:** [IDRE-428](https://orchidsoftware.atlassian.net//browse/IDRE-428)
 
 ## Summary
-Implement logic to automatically place IDRE payouts for Capitol Bridge, VeraTru, and Halo on hold if either party has an outstanding balance, and release the hold via Stripe webhooks once both parties are paid in full.
+Implement business rules to automatically place IDRE payouts for Capitol Bridge, VeraTru, and Halo on 'Hold' if either party has an outstanding balance, and release them to the Banking Dashboard once both parties have paid in full.
 
 ## Implementation Plan
 
-**Step 1: Set Initial Hold Status on Payout Creation**  
-In `triggerCapitolBridgeRefunds` and `triggerInternalDistributions`, after the payouts are generated, calculate the case's current IP and NIP balances. If either balance is greater than zero, query the newly created `Payment` records for Capitol Bridge, VeraTru, and Halo, and update their status to `PaymentStatus.HOLD`.
+**Step 1: Enforce Automatic Hold on Payout Creation**  
+In `triggerCapitolBridgeRefunds` and `triggerInternalDistributions` (or equivalent payout creation logic), after the payouts are generated, query the case to check the outstanding balances for both the Initiating Party (IP) and Non-Initiating Party (NIP). If either party has a balance greater than zero, update the newly created `Payment` records for Capitol Bridge, VeraTru, and Halo to have `status = PaymentStatus.HOLD`.
 Files: `lib/actions/refund-processing.ts`
 
-**Step 2: Release Hold on Full Payment in Webhook**  
-In the `payment_intent.succeeded` handler (`handlePaymentSuccess`), after recording the successful payment and updating balances, check if both the IP and NIP balances for the associated case are now zero (paid in full). If they are, query for any `Payment` records linked to the case for Capitol Bridge, VeraTru, or Halo that have `status === PaymentStatus.HOLD`, and update their status to `PaymentStatus.PENDING` (or the appropriate ready status) to release the hold.
+**Step 2: Release Hold Status Upon Full Payment**  
+In the `handlePaymentSuccess` function, after successfully processing a payment, check if the associated case now has both the IP and NIP paid in full (balances equal to zero). If both parties are fully paid, query for any `Payment` records linked to the case for Capitol Bridge, VeraTru, or Halo that are currently in `PaymentStatus.HOLD`. Update their status to `PaymentStatus.PENDING` (or the appropriate ready status) so they can be finalized.
 Files: `app/api/stripe/webhook/route.ts`
 
-**Step 3: Exclude Held Payouts from Banking Dashboard**  
-Update the data fetching and client-side filtering logic for the Banking Dashboard to explicitly exclude any payments where `status === PaymentStatus.HOLD`. This ensures that held IDRE payouts do not appear in the 'Ready' or 'Pending Finalization' views until their hold is released.
+**Step 3: Hide Hold Payouts from Banking Dashboard Finalization**  
+In the component's state management or rendering logic for pending payments, add a filter to explicitly exclude any payouts for Capitol Bridge, VeraTru, or Halo that have `status === PaymentStatus.HOLD`. This ensures they do not appear on the Banking Dashboard for finalization until their status is updated to a ready state.
 Files: `app/dashboard/payments/payments-client.tsx`
 
-**Risk Level:** MEDIUM — Modifying payment statuses and webhook handlers involves core financial logic. Incorrect balance calculations could result in payouts being held indefinitely or released prematurely.
+**Risk Level:** LOW — The changes are localized to the payout creation and payment success webhook handlers. The logic strictly targets specific payees (Capitol Bridge, VeraTru, Halo) and relies on existing balance checks, minimizing the risk of affecting other payment flows.
 
 **Deployment Notes:**
-- Ensure that any existing payouts that should be on hold are manually updated or handled via a one-time script, as this fix will only apply to newly created payouts and future webhook events.
+- Ensure that any existing payouts that should be on hold are manually updated or handled via a one-time script, as this implementation only applies the rule to newly created or newly paid payouts.
 
 ## Proposed Code Changes
 
 ### `lib/actions/refund-processing.ts` (modify)
 No rationale provided
 ```typescript
-}
 // Process missing refunds/payouts idempotently.
 const capitolBridgeResult = await processCapitolBridgeRefunds(caseId);
 const internalDistributionsResult = await ensureInternalRefundDistributions(caseId);
@@ -37,15 +36,25 @@ const internalDistributionsResult = await ensureInternalRefundDistributions(case
 
 ## Test Suggestions
 
-Framework: `Jest`
+Framework: `Vitest`
 
-- **should set payout status to Hold on creation when IP has outstanding balance** — Verifies that a new IDRE payout for a specified entity is placed on hold if either party has not paid in full.
-- **should set payout status to Ready on creation when both parties are paid in full** — Verifies that a new IDRE payout bypasses the hold if both parties have already paid in full at the time of creation.
-- **should keep payout in Hold status when webhook processes a partial payment** *(edge case)* — Ensures that partial payments processed via webhook do not prematurely release the hold on the payout.
-- **should release payout to Ready status when webhook processes final payment bringing balances to zero** — Verifies that the hold is automatically released when the final payment is processed via webhook.
+- **shouldSetPayoutStatusToHoldOnCreationWhenIpBalanceIsNotZero** — Verifies that a new IDRE payout for Capitol Bridge is automatically placed on hold if the IP has an outstanding balance.
+- **shouldKeepPayoutInHoldStatusWhenPartialPaymentIsMade** — Verifies that partial payments do not prematurely release the IDRE payout from the Hold status.
+- **shouldReleasePayoutToBankingDashboardWhenBothPartiesPaidInFull** — Verifies that the payout is automatically released to the Banking Dashboard once both IP and NIP balances reach zero.
+- **shouldNotApplyHoldRuleToOtherEntities** *(edge case)* — Ensures that the hold rule is strictly applied only to the specified entities (Capitol Bridge, VeraTru, Halo).
+
+## Confluence Documentation References
+
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page outlines the end-to-end case lifecycle for Capitol Bridge, including the Payment/Accounting actors and the payment collection phase, which will be directly impacted by the new payout hold logic.
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This page defines the core workflow phases (including Payment Collection) and the key parties (IP and NIP) whose payment statuses dictate the new payout hold rules.
+
+**Suggested Documentation Updates:**
+
+- IDRE Worflow: Update the Case Lifecycle steps for Payment/Accounting to include the new 'Hold' status logic for Capitol Bridge payouts when IP/NIP balances are not zero.
+- IDRE Case Workflow Documentation: Update the Payment Collection phase details to document the conditional hold on payouts for Capitol Bridge, VeraTru, and Halo until both parties have paid in full.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 95%, Tests: 95%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

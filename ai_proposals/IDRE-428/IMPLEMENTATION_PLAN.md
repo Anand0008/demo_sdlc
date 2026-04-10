@@ -3,58 +3,124 @@
 **Jira Ticket:** [IDRE-428](https://orchidsoftware.atlassian.net//browse/IDRE-428)
 
 ## Summary
-Implement business rules to automatically place IDRE payouts for Capitol Bridge, VeraTru, and Halo on 'Hold' if either party has an outstanding balance, and release them to the Banking Dashboard once both parties have paid in full.
+Update IDRE payout creation to set the status to 'Hold' if either party has an outstanding balance. Add an event listener to automatically release these holds when full payment is received, and ensure held payouts are hidden from the Banking Dashboard.
 
 ## Implementation Plan
 
-**Step 1: Enforce Automatic Hold on Payout Creation**  
-In `triggerCapitolBridgeRefunds` and `triggerInternalDistributions` (or equivalent payout creation logic), after the payouts are generated, query the case to check the outstanding balances for both the Initiating Party (IP) and Non-Initiating Party (NIP). If either party has a balance greater than zero, update the newly created `Payment` records for Capitol Bridge, VeraTru, and Halo to have `status = PaymentStatus.HOLD`.
-Files: `lib/actions/refund-processing.ts`
+**Step 1: Set Initial Payout Status to Hold Based on Balances**  
+Modify the payout creation logic for internal distributions (Capitol Bridge, VeraTru, Halo). When creating these payouts, check the IP and NIP balances (using the existing auto-approval check or similar logic). If either party has a balance greater than zero (not paid in full), set the initial status of the created payout to `HOLD` instead of `PENDING` or `APPROVED`.
+Files: `lib/services/refund-service.ts`
 
-**Step 2: Release Hold Status Upon Full Payment**  
-In the `handlePaymentSuccess` function, after successfully processing a payment, check if the associated case now has both the IP and NIP paid in full (balances equal to zero). If both parties are fully paid, query for any `Payment` records linked to the case for Capitol Bridge, VeraTru, or Halo that are currently in `PaymentStatus.HOLD`. Update their status to `PaymentStatus.PENDING` (or the appropriate ready status) so they can be finalized.
-Files: `app/api/stripe/webhook/route.ts`
+**Step 2: Automatically Release Held Payouts on Full Payment**  
+Create a function in `refund-service.ts` (e.g., `releaseHeldPayouts`) that checks a case's held payouts and updates their status to `PENDING` or `APPROVED` (ready for the Banking Dashboard) if both IP and NIP are now paid in full. Call this function from the payment completion event handler (e.g., in `case-subscriber.ts` listening to payment status changes or directly in the Stripe webhook handler) whenever a payment successfully completes.
+Files: `lib/events/subscribers/case-subscriber.ts`, `lib/services/refund-service.ts`
 
-**Step 3: Hide Hold Payouts from Banking Dashboard Finalization**  
-In the component's state management or rendering logic for pending payments, add a filter to explicitly exclude any payouts for Capitol Bridge, VeraTru, or Halo that have `status === PaymentStatus.HOLD`. This ensures they do not appear on the Banking Dashboard for finalization until their status is updated to a ready state.
+**Step 3: Hide Held Payouts from Banking Dashboard**  
+Ensure the Banking Dashboard queries or filters explicitly exclude payouts with a `HOLD` status from the list of payouts ready for finalization, so they do not appear until their status is updated.
 Files: `app/dashboard/payments/payments-client.tsx`
 
-**Risk Level:** LOW — The changes are localized to the payout creation and payment success webhook handlers. The logic strictly targets specific payees (Capitol Bridge, VeraTru, Halo) and relies on existing balance checks, minimizing the risk of affecting other payment flows.
-
-**Deployment Notes:**
-- Ensure that any existing payouts that should be on hold are manually updated or handled via a one-time script, as this implementation only applies the rule to newly created or newly paid payouts.
+**Risk Level:** MEDIUM — Modifying payout statuses and the conditions for their release involves financial workflows. Incorrect logic could lead to payouts being held indefinitely or released prematurely.
 
 ## Proposed Code Changes
 
-### `lib/actions/refund-processing.ts` (modify)
-No rationale provided
+### `lib/services/refund-service.ts` (modify)
+Sets the initial status of internal distributions to `HOLD` if the auto-approval check fails (meaning balances are not paid in full). Adds a new function `releaseHeldPayouts` to check and release these holds once full payment is confirmed.
 ```typescript
-// Process missing refunds/payouts idempotently.
-const capitolBridgeResult = await processCapitolBridgeRefunds(caseId);
-const internalDistributionsResult = await ensureInternalRefundDistributions(caseId);
+@@ -... +... @@
+-    const initialStatus = autoApprovalCheck.canAutoApprove 
+-      ? PaymentStatus.APPROVED 
+-      : PaymentStatus.PENDING;
++    const initialStatus = autoApprovalCheck.canAutoApprove 
++      ? PaymentStatus.APPROVED 
++      : PaymentStatus.HOLD;
+@@ -... +... @@
++/**
++ * Checks if a case has any held internal distributions and releases them
++ * if both parties have paid in full.
++ */
++export async function releaseHeldPayouts(caseId: string) {
++  const autoApprovalCheck = await checkInternalDistributionAutoApproval(caseId);
++  
++  // If balances are not paid in full, we cannot release the holds
++  if (!autoApprovalCheck.canAutoApprove) {
++    return { success: false, reason: "Balances not paid in full" };
++  }
++
++  // Find held payouts for this case
++  const heldPayouts = await prisma.payment.findMany({
++    where: {
++      caseId,
++      status: "HOLD",
++      direction: "OUTBOUND",
++    }
++  });
++
++  if (heldPayouts.length === 0) {
++    return { success: true, releasedCount: 0 };
++  }
++
++  // Update them to APPROVED so they appear on the Banking Dashboard
++  await prisma.payment.updateMany({
++    where: {
++      id: { in: heldPayouts.map(p => p.id) }
++    },
++    data: {
++      status: "APPROVED"
++    }
++  });
++
++  return { success: true, releasedCount: heldPayouts.length };
++}
+```
+
+### `lib/events/subscribers/case-subscriber.ts` (modify)
+Triggers the release of held payouts whenever a payment is completed, ensuring that payouts automatically move to the Banking Dashboard once both parties have paid in full.
+```typescript
+@@ -... +... @@
+ import { prisma } from "@/lib/database";
++import { releaseHeldPayouts } from "@/lib/services/refund-service";
+ 
+@@ -... +... @@
+ export async function handlePaymentCompleted(event: PaymentCompletedEvent) {
+   // Existing payment completion logic...
+   
++  // Check and release any held payouts if both parties are now paid in full
++  try {
++    await releaseHeldPayouts(event.caseId);
++  } catch (error) {
++    console.error(`Failed to release held payouts for case ${event.caseId}:`, error);
++  }
+ }
+```
+
+### `app/dashboard/payments/payments-client.tsx` (modify)
+Explicitly filters out any payouts with a `HOLD` status from the Banking Dashboard so they cannot be finalized prematurely.
+```
+@@ -... +... @@
+   const filteredPayments = useMemo(() => {
+     return payments.filter((payment) => {
++      // Hide held payouts from the Banking Dashboard
++      if (payment.status === 'HOLD') {
++        return false;
++      }
+       // Existing filter logic...
+       return true;
+     });
+   }, [payments, /* other dependencies */]);
 ```
 
 ## Test Suggestions
 
-Framework: `Vitest`
+Framework: `Jest / React Testing Library`
 
-- **shouldSetPayoutStatusToHoldOnCreationWhenIpBalanceIsNotZero** — Verifies that a new IDRE payout for Capitol Bridge is automatically placed on hold if the IP has an outstanding balance.
-- **shouldKeepPayoutInHoldStatusWhenPartialPaymentIsMade** — Verifies that partial payments do not prematurely release the IDRE payout from the Hold status.
-- **shouldReleasePayoutToBankingDashboardWhenBothPartiesPaidInFull** — Verifies that the payout is automatically released to the Banking Dashboard once both IP and NIP balances reach zero.
-- **shouldNotApplyHoldRuleToOtherEntities** *(edge case)* — Ensures that the hold rule is strictly applied only to the specified entities (Capitol Bridge, VeraTru, Halo).
-
-## Confluence Documentation References
-
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page outlines the end-to-end case lifecycle for Capitol Bridge, including the Payment/Accounting actors and the payment collection phase, which will be directly impacted by the new payout hold logic.
-- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This page defines the core workflow phases (including Payment Collection) and the key parties (IP and NIP) whose payment statuses dictate the new payout hold rules.
-
-**Suggested Documentation Updates:**
-
-- IDRE Worflow: Update the Case Lifecycle steps for Payment/Accounting to include the new 'Hold' status logic for Capitol Bridge payouts when IP/NIP balances are not zero.
-- IDRE Case Workflow Documentation: Update the Payment Collection phase details to document the conditional hold on payouts for Capitol Bridge, VeraTru, and Halo until both parties have paid in full.
+- **shouldCreatePayoutWithHoldStatusWhenBalancesOutstanding** — Verifies that a new IDRE payout is automatically placed on hold if both parties have not paid in full.
+- **shouldNotReleaseHeldPayoutsWhenPartialPaymentLeavesBalance** *(edge case)* — Verifies that a partial payment does not prematurely release the hold on an IDRE payout.
+- **shouldReleaseHeldPayoutsWhenAllPartiesPaidInFull** — Verifies that held payouts are released when both parties are paid in full.
+- **shouldTriggerReleaseHeldPayoutsOnPaymentCompletedEvent** — Verifies that the case subscriber listens to payment completions and triggers the release check.
+- **shouldFilterOutHoldPayoutsFromBankingDashboard** — Verifies that payouts in HOLD status are hidden from the Banking Dashboard.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 85%, Tests: 95%
+Plan: 85%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

@@ -3,73 +3,104 @@
 **Jira Ticket:** [IDRE-508](https://orchidsoftware.atlassian.net//browse/IDRE-508)
 
 ## Summary
-Ensure invoices are attached to all payment request emails regardless of bank account status
+Update the email generation logic to ensure that invoices are always attached to payment request emails (Initial fees due, Early closure path, Underpayment), regardless of whether the organization has bank account information on file.
 
 ## Implementation Plan
 
-**Step 1: Remove bank account condition for invoice attachments in email workflow**  
-Locate the email generation and sending logic for payment requests (Initial fees due, Early closure, Underpayment) in `lib/actions/email-workflow.ts` (which exports `sendPaymentEmailForCase` and `generatePaymentEmailPreview`). Remove the conditional check that suppresses the invoice attachment when the organization has bank account information on file. Ensure the invoice is always attached to the email payload.
+**Step 1: Remove bank account condition from email workflow attachments**  
+Locate the email preparation functions such as `sendPaymentEmailForCase`, `sendAdministrativeClosureEmails`, and any variance/underpayment email handlers. Find the conditional logic that checks if the organization has bank account information on file before attaching the invoice. Remove this condition to ensure the invoice PDF is always generated and appended to the email attachments array.
 Files: `lib/actions/email-workflow.ts`
 
-**Step 2: Update email service attachment logic**  
-If the attachment construction logic is handled or delegated within `lib/actions/email.ts`, update the relevant payment email functions to always append the invoice document to the attachments array, removing any dependency on the organization's bank account status.
-Files: `lib/actions/email.ts`
+**Step 2: Ensure unconditional invoice attachment in payment actions and email jobs**  
+Review the invocation of `createIDRPaymentEmailJob` and the construction of the `EmailAttachment` array. If there is any logic that omits the invoice attachment based on the presence of a bank account, remove it. Ensure that `generateInvoicePDFBuffer` is called and its output is always included in the attachments payload for payment request emails.
+Files: `lib/actions/payment.ts`, `lib/services/email/email-job-service.ts`
 
-**Risk Level:** LOW — The change only involves removing a conditional check for email attachments, ensuring invoices are always included. It does not affect payment processing, database schemas, or core business logic.
+**Risk Level:** LOW — The change only affects the payload of outgoing emails by ensuring an attachment is always included. It does not alter core payment processing, database schemas, or state transitions.
 
 ## Proposed Code Changes
 
 ### `lib/actions/email-workflow.ts` (modify)
-The acceptance criteria require that an invoice must be attached to every payment request email (Initial fees due, Early closure, Underpayment). This removes the previous condition that suppressed the invoice attachment when a bank account was on file.
+Ensure that the invoice PDF is always generated and appended to the email attachments array for payment request emails, regardless of whether the organization has bank account information on file. This applies to initial fees due, early closure path, and underpayment emails.
 ```typescript
 --- a/lib/actions/email-workflow.ts
 +++ b/lib/actions/email-workflow.ts
-@@ -1,12 +1,8 @@
--    // Check if organization has a bank account to determine if invoice should be attached
--    const hasBankAccount = organization?.bankAccounts && organization.bankAccounts.length > 0;
--    
--    // Only attach invoice if organization has no bank account
--    if (!hasBankAccount && invoiceBuffer) {
-+    // Always attach invoice regardless of bank account status
-+    if (invoiceBuffer) {
-       attachments.push({
-         filename: `Invoice_${invoice.invoiceNumber}.pdf`,
-         content: invoiceBuffer.toString('base64'),
-         type: 'application/pdf',
-         disposition: 'attachment',
-       });
-     }
+@@ -100,11 +100,9 @@
+-    // Check if organization has bank account
+-    if (!hasBankAccount) {
+-      const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
+-      attachments.push({
+-        filename: `Invoice-${invoiceNumber}.pdf`,
+-        content: invoiceBuffer.toString("base64"),
+-        contentType: "application/pdf",
+-      });
+-    }
++    // Always generate and attach invoice
++    const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
++    attachments.push({
++      filename: `Invoice-${invoiceNumber}.pdf`,
++      content: invoiceBuffer.toString("base64"),
++      contentType: "application/pdf",
++    });
 ```
 
-### `lib/actions/email.ts` (modify)
-Ensures any delegated email sending or attachment construction logic in `email.ts` also unconditionally attaches the invoice for payment emails, aligning with the updated workflow logic.
+### `lib/actions/payment.ts` (modify)
+Remove any logic that omits the invoice attachment based on the presence of a bank account when preparing payment actions. Ensure `generateInvoicePDFBuffer` is called and its output is always included in the attachments payload.
 ```typescript
---- a/lib/actions/email.ts
-+++ b/lib/actions/email.ts
-@@ -1,6 +1,5 @@
--    const hasBankAccount = data.organization?.bankAccounts?.length > 0;
--    
--    if (!hasBankAccount && data.invoiceAttachment) {
-+    // Unconditionally attach the invoice for payment emails
-+    if (data.invoiceAttachment) {
-       attachments.push(data.invoiceAttachment);
-     }
+--- a/lib/actions/payment.ts
++++ b/lib/actions/payment.ts
+@@ -200,11 +200,9 @@
+-    // Only attach invoice if no banking info is present
+-    if (!hasBankingInfo) {
+-      const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
+-      attachments.push({
+-        filename: `Invoice-${invoiceNumber}.pdf`,
+-        content: invoiceBuffer.toString("base64"),
+-        contentType: "application/pdf",
+-      });
+-    }
++    // Always generate and attach invoice
++    const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
++    attachments.push({
++      filename: `Invoice-${invoiceNumber}.pdf`,
++      content: invoiceBuffer.toString("base64"),
++      contentType: "application/pdf",
++    });
 ```
 
-**New Dependencies:**
-- `None`
+### `lib/services/email/email-job-service.ts` (modify)
+Ensure that the email job service unconditionally includes the invoice attachment for payment request emails, removing any checks for bank account presence.
+```typescript
+--- a/lib/services/email/email-job-service.ts
++++ b/lib/services/email/email-job-service.ts
+@@ -50,11 +50,9 @@
+-    // Conditionally attach invoice
+-    if (!hasBankAccount) {
+-      const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
+-      attachments.push({
+-        filename: `Invoice-${invoiceNumber}.pdf`,
+-        content: invoiceBuffer.toString("base64"),
+-        contentType: "application/pdf",
+-      });
+-    }
++    // Always attach invoice
++    const invoiceBuffer = await generateInvoicePDFBuffer(invoiceData);
++    attachments.push({
++      filename: `Invoice-${invoiceNumber}.pdf`,
++      content: invoiceBuffer.toString("base64"),
++      contentType: "application/pdf",
++    });
+```
 
 ## Test Suggestions
 
-Framework: `Vitest`
+Framework: `Jest/Vitest`
 
-- **shouldAttachInvoiceToInitialFeesDueEmailWhenBankAccountExists** *(edge case)* — Verifies that the bug is fixed by ensuring the invoice is attached to the Initial Fees Due email when the organization already has a bank account on file.
-- **shouldAttachInvoiceToEarlyClosureEmailWhenBankAccountExists** *(edge case)* — Verifies that the invoice is attached to the Early Closure path email for organizations with bank accounts, satisfying the second AC.
-- **shouldAttachInvoiceToUnderpaymentEmailWhenBankAccountExists** *(edge case)* — Verifies that the invoice is attached to the Underpayment (variance) email for organizations with bank accounts, satisfying the third AC.
-- **shouldAttachInvoiceToPaymentEmailsWhenNoBankAccountExists** — Baseline regression test to ensure that the standard behavior (attaching invoices for orgs without bank accounts) remains intact after removing the conditional logic.
+- **shouldAttachInvoiceToInitialFeesDueEmailWhenOrgHasBankAccount** — Regression test to ensure that the initial fees due email includes the invoice attachment even when the organization has a bank account on file.
+- **shouldIncludeInvoiceInUnderpaymentActionAttachmentsRegardlessOfBankAccount** — Regression test to verify that payment actions for underpayments always include the invoice attachment.
+- **shouldAttachInvoiceToEarlyClosureEmailsWhenProcessingJob** — Regression test to ensure the email job service unconditionally includes the invoice attachment for early closure path emails.
 
 ## AI Confidence Scores
-Plan: 80%, Code: 85%, Tests: 95%
+Plan: 85%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

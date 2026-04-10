@@ -3,73 +3,73 @@
 **Jira Ticket:** [IDRE-508](https://orchidsoftware.atlassian.net//browse/IDRE-508)
 
 ## Summary
-Update payment request email logic to always attach invoices, removing the condition that skips attachments for organizations with bank accounts.
+Ensure invoices are attached to all payment request emails regardless of bank account status
 
 ## Implementation Plan
 
-**Step 1: Always attach invoice in payment email button payload**  
-Locate the logic that prepares the email payload for payment requests (Initial fees due, Early closure, Underpayment). Remove the conditional check that omits the invoice attachment when the organization has bank account information on file. Ensure the invoice data or attachment flag is always included in the payload sent to the email service.
-Files: `components/email/send-payment-email-button.tsx`
+**Step 1: Remove bank account condition for invoice attachments in email workflow**  
+Locate the email generation and sending logic for payment requests (Initial fees due, Early closure, Underpayment) in `lib/actions/email-workflow.ts` (which exports `sendPaymentEmailForCase` and `generatePaymentEmailPreview`). Remove the conditional check that suppresses the invoice attachment when the organization has bank account information on file. Ensure the invoice is always attached to the email payload.
+Files: `lib/actions/email-workflow.ts`
 
-**Step 2: Include invoice in underpayment failure emails**  
-In the `markPaymentAsFailed` function, when an underpayment (variance) is detected and the corresponding notification email is triggered, ensure the associated invoice is fetched and explicitly attached to the email payload, regardless of the organization's bank account status.
-Files: `lib/actions/payment-failure.ts`
+**Step 2: Update email service attachment logic**  
+If the attachment construction logic is handled or delegated within `lib/actions/email.ts`, update the relevant payment email functions to always append the invoice document to the attachments array, removing any dependency on the organization's bank account status.
+Files: `lib/actions/email.ts`
 
-**Risk Level:** LOW — The changes only affect email payloads by adding an attachment that was previously conditionally omitted. The primary risk is if an invoice fails to generate, which could potentially block the email from sending if not handled gracefully.
-
-**Deployment Notes:**
-- Verify that the email service provider (e.g., SendGrid, AWS SES) can handle the increased volume of attachments.
-- Ensure invoice generation does not significantly delay the email sending process.
+**Risk Level:** LOW — The change only involves removing a conditional check for email attachments, ensuring invoices are always included. It does not affect payment processing, database schemas, or core business logic.
 
 ## Proposed Code Changes
 
-### `components/email/send-payment-email-button.tsx` (modify)
-The acceptance criteria require that an invoice must be attached to every payment request email (Initial fees due, Early closure, Underpayment), regardless of whether the organization has bank account information on file. Removing the conditional check ensures the invoice is always included in the payload.
-```
---- components/email/send-payment-email-button.tsx
-+++ components/email/send-payment-email-button.tsx
-@@ -...@@
--    // Previously omitted invoice if organization had a bank account
--    const shouldAttachInvoice = !organization?.bankAccount;
-     
-     const payload = {
-       // ... existing payload properties
--      attachInvoice: shouldAttachInvoice,
-+      attachInvoice: true, // Always attach invoice as per IDRE-508
-     };
+### `lib/actions/email-workflow.ts` (modify)
+The acceptance criteria require that an invoice must be attached to every payment request email (Initial fees due, Early closure, Underpayment). This removes the previous condition that suppressed the invoice attachment when a bank account was on file.
+```typescript
+--- a/lib/actions/email-workflow.ts
++++ b/lib/actions/email-workflow.ts
+@@ -1,12 +1,8 @@
+-    // Check if organization has a bank account to determine if invoice should be attached
+-    const hasBankAccount = organization?.bankAccounts && organization.bankAccounts.length > 0;
+-    
+-    // Only attach invoice if organization has no bank account
+-    if (!hasBankAccount && invoiceBuffer) {
++    // Always attach invoice regardless of bank account status
++    if (invoiceBuffer) {
+       attachments.push({
+         filename: `Invoice_${invoice.invoiceNumber}.pdf`,
+         content: invoiceBuffer.toString('base64'),
+         type: 'application/pdf',
+         disposition: 'attachment',
+       });
+     }
 ```
 
-### `lib/actions/payment-failure.ts` (modify)
-Ensures that when an underpayment (variance) is detected in `markPaymentAsFailed` and the corresponding notification email is triggered, the associated invoice is explicitly attached to the email payload, regardless of the organization's bank account status.
+### `lib/actions/email.ts` (modify)
+Ensures any delegated email sending or attachment construction logic in `email.ts` also unconditionally attaches the invoice for payment emails, aligning with the updated workflow logic.
 ```typescript
---- lib/actions/payment-failure.ts
-+++ lib/actions/payment-failure.ts
-@@ -...@@
-         // Logic for handling underpayment/variance notification
-         if (isVariance) {
-           await sendPaymentNotificationEmail({
-             // ... existing payload properties
--            includeInvoice: !hasBankAccount,
-+            includeInvoice: true, // Always attach invoice as per IDRE-508
-           });
-         }
+--- a/lib/actions/email.ts
++++ b/lib/actions/email.ts
+@@ -1,6 +1,5 @@
+-    const hasBankAccount = data.organization?.bankAccounts?.length > 0;
+-    
+-    if (!hasBankAccount && data.invoiceAttachment) {
++    // Unconditionally attach the invoice for payment emails
++    if (data.invoiceAttachment) {
+       attachments.push(data.invoiceAttachment);
+     }
 ```
+
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
 Framework: `Vitest`
 
-- **shouldIncludeInvoiceInPayloadWhenOrgHasBankAccount** — Verifies that the invoice is attached to the email payload even when the organization has a bank account (removing the previous conditional skip).
-- **shouldIncludeInvoiceInPayloadWhenOrgDoesNotHaveBankAccount** — Verifies that the invoice is attached to the email payload when the organization does not have a bank account (standard happy path).
-- **shouldAttachInvoiceToUnderpaymentEmailRegardlessOfBankAccount** — Ensures that underpayment (variance) emails triggered by payment failures always include the invoice, regardless of bank account status.
-- **shouldThrowErrorIfInvoiceIsMissingForUnderpaymentEmail** *(edge case)* — Tests the edge case where an invoice is required for the underpayment email but is missing from the system.
-
-## Confluence Documentation References
-
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — Highlights the complexity and historical issues within the payments and refunds engine, specifically mentioning closure types, invoices, and under-payments which are directly related to the ticket's scope.
+- **shouldAttachInvoiceToInitialFeesDueEmailWhenBankAccountExists** *(edge case)* — Verifies that the bug is fixed by ensuring the invoice is attached to the Initial Fees Due email when the organization already has a bank account on file.
+- **shouldAttachInvoiceToEarlyClosureEmailWhenBankAccountExists** *(edge case)* — Verifies that the invoice is attached to the Early Closure path email for organizations with bank accounts, satisfying the second AC.
+- **shouldAttachInvoiceToUnderpaymentEmailWhenBankAccountExists** *(edge case)* — Verifies that the invoice is attached to the Underpayment (variance) email for organizations with bank accounts, satisfying the third AC.
+- **shouldAttachInvoiceToPaymentEmailsWhenNoBankAccountExists** — Baseline regression test to ensure that the standard behavior (attaching invoices for orgs without bank accounts) remains intact after removing the conditional logic.
 
 ## AI Confidence Scores
-Plan: 60%, Code: 85%, Tests: 95%
+Plan: 80%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

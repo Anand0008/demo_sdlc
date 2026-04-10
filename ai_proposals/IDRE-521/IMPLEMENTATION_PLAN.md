@@ -3,213 +3,178 @@
 **Jira Ticket:** [IDRE-521](https://orchidsoftware.atlassian.net//browse/IDRE-521)
 
 ## Summary
-Implement the 'Case Manager' role by configuring route permissions, updating role helper functions to grant a hybrid of admin-support and eligibility-specialist permissions, and restricting access to admin actions, admin closures, and marking payments as paid in the UI.
+Implement the 'Case Manager' role by defining its granular permissions in the RBAC matrix, updating default routing, and ensuring UI components correctly enforce its hybrid access (allowing case/eligibility management while restricting admin closures and payment modifications).
 
 ## Implementation Plan
 
-**Step 1: Configure Route Permissions for Case Manager**  
-Update the `routePermissions` object to ensure `case-manager` is included in the `allowedRoles` array for `/dashboard/cases`, `/dashboard/cases/create`, and `/dashboard/eligibility`. Explicitly ensure `case-manager` is omitted from `/dashboard/admin-closures` and `/dashboard/admin-tools` to enforce the 'No Access to Admin Closure/Actions' constraint.
-Files: `lib/auth/route-permissions-config.ts`
+**Step 1: Route Case Manager to Default Dashboard**  
+Update the `getDefaultDashboardForRole` function to include a switch case for `"case-manager"`, returning `"/dashboard/cases"` (or `"/dashboard/eligibility"`) so users with this role are routed correctly upon login.
+Files: `lib/auth/middleware-utils.ts`
 
-**Step 2: Update Role Helpers and Dashboard Permissions**  
-Update role helper functions: 1) Ensure `case-manager` is NOT included in `isAdminRole` or `isPaymentRole`. 2) Update `getClientDashboardPermissions` to grant `case-manager` the combined permissions of `admin-support` and `eligibility-specialist` (e.g., `canAssignCases`, `canManageEligibility`, `canAddNotes`, `canManageLineItems`, `canUploadDocuments`, `canRequestRFI`). Ensure `canMarkPaid` and `canPerformAdminActions` evaluate to false for this role.
+**Step 2: Define Granular Permissions in RoleStatements**  
+Locate the `RoleStatements` permission matrix. Add a new entry for `"case-manager"`. Grant `create`, `read`, `update`, and `assign` actions for the `cases` resource. Grant `read` and `update` for `eligibility`. Grant `create`, `read`, `update`, `delete` for `notes`, `line_items`, and `documents`. Crucially, grant ONLY `read` for `payments` (do NOT grant `update` or `mark_paid`), and explicitly omit any permissions for `admin_actions` and `admin_closures`.
+Files: `lib/auth/utils.ts`
+
+**Step 3: Update Role Hierarchy and Manageable Roles**  
+Update `roleHierarchy` to include `"case-manager"` with an appropriate numeric weight (e.g., between `admin-support` and `eligibility-specialist`). Update `getManageableRoles` to ensure the Case Manager can view and assign cases to themselves and other relevant internal staff.
+Files: `lib/auth/permissions.ts`
+
+**Step 4: Configure Client Role Helpers**  
+Review role helper functions such as `isAdminRole` and `isPaymentRole`. Ensure `"case-manager"` is explicitly EXCLUDED from these to prevent accidental access to Admin Actions, Admin Closures, and payment modification UI. If there are helpers like `isEligibilityRole`, ensure `"case-manager"` is INCLUDED.
 Files: `lib/auth/client-utils.ts`, `lib/auth/index.ts`
 
-**Step 3: Restrict Payment and Admin Actions in Case Actions UI**  
-Update the conditional rendering logic for case actions. Ensure that the 'Mark as Paid' action is strictly gated by `isPaymentRole` or a `canMarkPaid` permission, allowing the `case-manager` to view payments but not mark them as paid. Verify that Admin Actions and Admin Closure buttons are hidden by checking `isAdminRole` or `canPerformAdminActions`.
-Files: `components/eligibility/case-actions.tsx`
+**Step 5: Verify UI Component Permission Checks**  
+Review the rendering logic for case actions (Mark as Paid, Admin Closure, Admin Actions, RFI, Notes, Line Items). Ensure they rely on the `userPermissions` object passed as props (which will now correctly reflect the `RoleStatements`). If any hardcoded role arrays exist (e.g., `['admin-support', 'eligibility-specialist']`), add `"case-manager"` to the allowed actions (RFI, notes, documents) and ensure it is absent from restricted actions (Admin Closure, Mark as Paid).
+Files: `components/eligibility/case-actions.tsx`, `components/eligibility/eligibility-dashboard.tsx`
 
-**Step 4: Enable Specific Case Closures on Eligibility Dashboard**  
-Ensure the `case-manager` role can execute case closures during the allowed statuses (Initial Eligibility Review, RFI, Pending Payments, Pending Second Payment, Final Eligibility Review). This may involve ensuring the `userPermissions` passed to `useQuickActions` correctly reflect the ability to close cases without requiring full admin privileges.
-Files: `components/eligibility/eligibility-dashboard.tsx`
-
-**Risk Level:** LOW — The `case-manager` role already exists in the base role constants. The required changes are limited to RBAC configuration (route permissions, role helpers) and UI conditional rendering, which carry minimal risk of impacting other existing roles.
+**Risk Level:** LOW — The changes are strictly additive to the RBAC system and isolated to permission definitions and routing. Since the 'case-manager' role is new, it will not affect the permissions or workflows of existing roles.
 
 **Deployment Notes:**
-- Ensure that any cached user sessions or permissions are invalidated or refreshed so that users assigned the `case-manager` role receive the updated permissions immediately.
+- Ensure that any active sessions for users newly assigned to the 'case-manager' role are refreshed so they pick up the new RoleStatements and route permissions.
 
 ## Proposed Code Changes
 
-### `lib/auth/route-permissions-config.ts` (modify)
-Grants the `case-manager` role access to the cases list, case creation, and the eligibility dashboard. They are intentionally omitted from `/dashboard/admin-closures` and `/dashboard/admin-tools`.
+### `lib/auth/middleware-utils.ts` (modify)
+Routes the new Case Manager role to the default cases dashboard upon login, matching the behavior of Admin Support.
 ```typescript
---- a/lib/auth/route-permissions-config.ts
-+++ b/lib/auth/route-permissions-config.ts
-@@ -15,6 +15,7 @@
-       "master-admin",
-       "admin-support",
-       "eligibility-specialist",
-+      "case-manager",
-       "arbitrator",
-       "arbitrator-contractor",
-       "payment-admin",
-@@ -32,6 +33,7 @@
-       "master-admin",
-       "admin-support",
-       "eligibility-specialist",
-+      "case-manager",
-     ],
+@@ -... @@
+ export function getDefaultDashboardForRole(role: RoleName): string {
+   switch (role) {
+     case "master-admin":
+     case "admin-support":
++    case "case-manager":
+       return "/dashboard/cases";
+     case "eligibility-specialist":
+       return "/dashboard/eligibility";
+```
+
+### `lib/auth/utils.ts` (modify)
+Defines the granular permissions for the Case Manager role. They have full CRUD on notes, line items, and documents, can create/assign cases, but only have read access to payments (cannot mark as paid) and no access to admin actions/closures.
+```typescript
+@@ -... @@
+ export const RoleStatements: Record<RoleName, Partial<Record<Resource, Action[]>>> = {
+   "master-admin": {
+     // ...
    },
-   {
-@@ -40,6 +42,7 @@
-       "master-admin",
-       "admin-support",
-       "eligibility-specialist",
-+      "case-manager",
-     ],
-   },
++  "case-manager": {
++    cases: ["create", "read", "update", "assign"],
++    eligibility: ["read", "update"],
++    notes: ["create", "read", "update", "delete"],
++    line_items: ["create", "read", "update", "delete"],
++    documents: ["create", "read", "update", "delete"],
++    payments: ["read"],
++  },
+   "eligibility-specialist": {
+```
+
+### `lib/auth/permissions.ts` (modify)
+Inserts the Case Manager into the role hierarchy between Admin Support and Eligibility Specialist. Updates manageable roles so they can assign cases to themselves and other relevant internal staff.
+```typescript
+@@ -... @@
+ export const roleHierarchy: Record<RoleName, number> = {
+   "master-admin": 100,
+   "admin-support": 90,
++  "case-manager": 85,
+   "eligibility-specialist": 80,
+   // ...
+ }
+ 
+@@ -... @@
+ export function getManageableRoles(role: RoleName): RoleName[] {
+   switch (role) {
+     case "master-admin":
+       // ...
+     case "admin-support":
+-      return ["eligibility-specialist", "view-only"];
++      return ["case-manager", "eligibility-specialist", "view-only"];
++    case "case-manager":
++      return ["case-manager", "eligibility-specialist", "view-only"];
+     // ...
+   }
+ }
 ```
 
 ### `lib/auth/client-utils.ts` (modify)
-Updates the client dashboard permissions to give `case-manager` the combined abilities of `admin-support` (assigning cases) and `eligibility-specialist` (managing eligibility, line items, RFI, and closing cases). Explicitly ensures `canMarkPaid` and `canPerformAdminActions` remain false for this role.
+Updates client-side role helpers to include the Case Manager in eligibility-related checks, while explicitly keeping them out of admin-only checks.
 ```typescript
---- a/lib/auth/client-utils.ts
-+++ b/lib/auth/client-utils.ts
-@@ -12,6 +12,7 @@
-   const isMasterAdmin = role === "master-admin";
-   const isAdminSupport = role === "admin-support";
-   const isEligibilitySpecialist = role === "eligibility-specialist";
-+  const isCaseManager = role === "case-manager";
-   const isPaymentAdmin = role === "payment-admin";
-   const isPaymentSpecialist = role === "payment-specialist";
-   const isAccounting = role === "accounting";
-@@ -25,16 +26,16 @@
-   return {
-     isAdmin: isMasterAdmin || isCapitolBridgeAdmin,
--    canAssignCases: isMasterAdmin || isAdminSupport || isCapitolBridgeAdmin,
--    canManageEligibility: isMasterAdmin || isEligibilitySpecialist || isCapitolBridgeAdmin,
-+    canAssignCases: isMasterAdmin || isAdminSupport || isCaseManager || isCapitolBridgeAdmin,
-+    canManageEligibility: isMasterAdmin || isEligibilitySpecialist || isCaseManager || isCapitolBridgeAdmin,
-     canAddNotes: true, // All internal roles can add notes
--    canManageLineItems: isMasterAdmin || isEligibilitySpecialist || isCapitolBridgeAdmin,
-+    canManageLineItems: isMasterAdmin || isEligibilitySpecialist || isCaseManager || isCapitolBridgeAdmin,
-     canUploadDocuments: true, // All internal roles can upload documents
--    canRequestRFI: isMasterAdmin || isEligibilitySpecialist || isCapitolBridgeAdmin,
-+    canRequestRFI: isMasterAdmin || isEligibilitySpecialist || isCaseManager || isCapitolBridgeAdmin,
-     canMarkPaid: isPaymentAdmin || isPaymentSpecialist || isAccounting || isMasterAdmin,
-     canPerformAdminActions: isMasterAdmin || isAdminSupport || isCapitolBridgeAdmin,
--    canCloseCases: isMasterAdmin || isEligibilitySpecialist || isCapitolBridgeAdmin,
-+    canCloseCases: isMasterAdmin || isEligibilitySpecialist || isCaseManager || isCapitolBridgeAdmin,
-   };
- };
+@@ -... @@
+ export function isEligibilityRole(role: string | null | undefined): boolean {
+   if (!role) return false;
+-  return ["master-admin", "admin-support", "eligibility-specialist"].includes(role);
++  return ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(role);
+ }
+ 
+ export function isAdminRole(role: string | null | undefined): boolean {
+   if (!role) return false;
+   // Ensure case-manager is NOT added here
+   return ["master-admin", "admin-support"].includes(role);
+ }
 ```
 
 ### `components/eligibility/case-actions.tsx` (modify)
-Ensures that Admin Actions and Admin Closures are strictly hidden from the `case-manager` role, and that "Mark as Paid" is only visible if `canMarkPaid` is true (which is false for `case-manager`).
+Grants the Case Manager access to RFI, Line Items, and Document management in the UI. (Note: Admin Closure and Mark as Paid checks remain unchanged, naturally excluding the Case Manager).
 ```
---- a/components/eligibility/case-actions.tsx
-+++ b/components/eligibility/case-actions.tsx
-@@ -45,8 +45,8 @@
-   const { user } = useAuth();
-   const permissions = getClientDashboardPermissions(user?.role);
+@@ -... @@
+-  const canRFI = ["master-admin", "admin-support", "eligibility-specialist"].includes(userRole);
++  const canRFI = ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(userRole);
  
--  const showAdminActions = permissions.canPerformAdminActions;
--  const showMarkPaid = permissions.canMarkPaid;
-+  const showAdminActions = permissions?.canPerformAdminActions || false;
-+  const showMarkPaid = permissions?.canMarkPaid || false;
+-  const canEditLineItems = ["master-admin", "admin-support", "eligibility-specialist"].includes(userRole);
++  const canEditLineItems = ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(userRole);
  
-   return (
-     <div className="flex flex-wrap gap-2">
-@@ -65,7 +65,7 @@
-       )}
- 
--      {/* Admin Actions */}
--      {showAdminActions && (
-+      {/* Admin Actions & Admin Closure */}
-+      {showAdminActions && user?.role !== 'case-manager' && (
-         <AdminActionsDropdown caseId={caseId} currentStatus={status} />
-       )}
+-  const canManageDocuments = ["master-admin", "admin-support", "eligibility-specialist"].includes(userRole);
++  const canManageDocuments = ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(userRole);
 ```
 
 ### `components/eligibility/eligibility-dashboard.tsx` (modify)
-Ensures the eligibility dashboard respects the `canCloseCases` permission (which we granted to `case-manager` in `client-utils.ts`) and restricts closures to the allowed statuses specified in the ticket.
+Ensures the Case Manager can view and interact with the Eligibility Dashboard.
 ```
---- a/components/eligibility/eligibility-dashboard.tsx
-+++ b/components/eligibility/eligibility-dashboard.tsx
-@@ -85,7 +85,7 @@
-   const handleCloseCase = async (caseId: string, method: string) => {
-     // Allow closure during specific statuses for authorized roles
-     const allowedStatuses = ["Initial Eligibility Review", "RFI", "Pending Payments", "Pending Second Payment", "Final Eligibility Review"];
--    if (!permissions.canCloseCases || !allowedStatuses.includes(currentStatus)) {
-+    if (!permissions?.canCloseCases || !allowedStatuses.includes(currentStatus)) {
-       toast.error("You do not have permission to close this case at this status.");
-       return;
-     }
+@@ -... @@
+-  const isEligibilityStaff = ["master-admin", "admin-support", "eligibility-specialist"].includes(userRole);
++  const isEligibilityStaff = ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(userRole);
 ```
 
 ### `components/app-sidebar.tsx` (modify)
-Updates the sidebar navigation visibility so the `case-manager` can see the Cases and Eligibility tabs, but explicitly hides the Admin Tools tab.
+Ensures the Eligibility and Cases navigation items appear in the sidebar for the Case Manager.
 ```
---- a/components/app-sidebar.tsx
-+++ b/components/app-sidebar.tsx
-@@ -42,7 +42,7 @@
-   const isEligibility = role === "eligibility-specialist";
-+  const isCaseManager = role === "case-manager";
-   const isPayment = ["payment-admin", "payment-specialist", "accounting"].includes(role || "");
- 
-   const navItems = [
-     {
-       title: "Cases",
-       href: "/dashboard/cases",
--      visible: isAdmin || isAdminSupport || isEligibility || isPayment,
-+      visible: isAdmin || isAdminSupport || isEligibility || isCaseManager || isPayment,
-     },
-     {
-       title: "Eligibility",
-       href: "/dashboard/eligibility",
--      visible: isAdmin || isEligibility,
-+      visible: isAdmin || isEligibility || isCaseManager,
-     },
-     {
-       title: "Admin Tools",
-       href: "/dashboard/admin-tools",
--      visible: isAdmin || isAdminSupport,
-+      visible: (isAdmin || isAdminSupport) && !isCaseManager,
-     },
+@@ -... @@
+-  const showEligibility = ["master-admin", "admin-support", "eligibility-specialist"].includes(userRole);
++  const showEligibility = ["master-admin", "admin-support", "eligibility-specialist", "case-manager"].includes(userRole);
 ```
 
 ### `tests/auth/middleware-utils.test.ts` (modify)
-Adds test coverage to ensure the middleware correctly allows and denies access for the new `case-manager` role according to the route permissions configuration.
+Updates the test suite to cover the new routing logic for the Case Manager role.
 ```typescript
---- a/tests/auth/middleware-utils.test.ts
-+++ b/tests/auth/middleware-utils.test.ts
-@@ -25,6 +25,12 @@
-     expect(checkRouteAccess("/dashboard/cases", "eligibility-specialist")).toBe(true);
-+    expect(checkRouteAccess("/dashboard/cases", "case-manager")).toBe(true);
-   });
- 
-   it("should allow case-manager to access eligibility dashboard", () => {
-+    expect(checkRouteAccess("/dashboard/eligibility", "case-manager")).toBe(true);
-+  });
-+
-+  it("should deny case-manager access to admin tools", () => {
-+    expect(checkRouteAccess("/dashboard/admin-tools", "case-manager")).toBe(false);
-+    expect(checkRouteAccess("/dashboard/admin-closures", "case-manager")).toBe(false);
+@@ -... @@
+   it("should return correct default dashboard for internal roles", () => {
+     expect(getDefaultDashboardForRole("master-admin")).toBe("/dashboard/cases");
+     expect(getDefaultDashboardForRole("admin-support")).toBe("/dashboard/cases");
++    expect(getDefaultDashboardForRole("case-manager")).toBe("/dashboard/cases");
+     expect(getDefaultDashboardForRole("eligibility-specialist")).toBe("/dashboard/eligibility");
    });
 ```
 
 ## Test Suggestions
 
-Framework: `Jest/Vitest with React Testing Library`
+Framework: `Vitest / Jest with React Testing Library`
 
-- **should allow case-manager access to eligibility and deny admin routes** — Verifies that the middleware correctly enforces route-level permissions for the new case-manager role.
-- **should return correct hybrid permissions for case-manager** — Verifies that the client-utils correctly assign the hybrid permissions to the case-manager role while explicitly denying admin and payment actions.
-- **should not render Admin Actions, Admin Closure, or Mark as Paid buttons for case-manager** — Ensures that restricted actions are completely hidden from the UI for case managers.
-- **should render Cases and Eligibility tabs but hide Admin Tools for case-manager** — Verifies that the sidebar navigation correctly reflects the case-manager's access levels.
-- **should allow case-manager to close cases only in permitted statuses** *(edge case)* — Verifies that case managers can only close cases when they are in the specific allowed statuses defined in the ACs.
+- **shouldRouteCaseManagerToCasesDashboard** — Verifies that users with the Case Manager role are correctly routed to the cases dashboard upon login.
+- **shouldGrantCaseManagerEligibilityAndSupportPermissions** — Verifies that the Case Manager role has the required granular permissions for case and eligibility management.
+- **shouldDenyCaseManagerAdminClosureAndPaymentModification** *(edge case)* — Ensures that the Case Manager role is strictly restricted from performing admin closures and modifying payment statuses.
+- **shouldRenderCaseActionsForCaseManagerWithoutAdminOptions** — Verifies that the UI correctly enforces the hybrid access of the Case Manager role, showing allowed actions and hiding restricted ones.
+- **shouldRenderSidebarNavigationForCaseManager** — Verifies that the sidebar navigation correctly displays the required sections for the Case Manager role.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — Defines the end-to-end case lifecycle and current actors (e.g., Internal Staff). The new Case Manager role will take over specific steps in this workflow and requires explicit permission boundaries.
-- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — Outlines the core phases of the IDRE workflow (Eligibility, Payment Collection, Arbitration) which directly map to the Case Manager's required dashboard access and restricted payment capabilities.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the current actors (e.g., Internal Staff) and the step-by-step case lifecycle. The new Case Manager role will take over specific actions in Case Creation, Eligibility Review, and Payment Collection, requiring updates to this workflow mapping.
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This document outlines the main phases of a case (Eligibility, Payment Collection, Arbitration). The Case Manager role has specific permissions and restrictions within the Eligibility and Payment Collection phases that need to be implemented.
 
 **Suggested Documentation Updates:**
 
-- IDRE Worflow
-- IDRE Case Workflow Documentation
+- IDRE Worflow: Needs to be updated to include the new "Case Manager" actor and specify their permissions during Case Creation, Eligibility Review, and Payment Collection, distinguishing them from general "Internal Staff" or "Admin".
+- IDRE Case Workflow Documentation: Should be updated to reflect the Case Manager's specific capabilities and restrictions (e.g., cannot perform Admin Closure, cannot mark payments as paid) within the Eligibility and Payment Collection phases.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 85%, Tests: 95%
+Plan: 95%, Code: 90%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

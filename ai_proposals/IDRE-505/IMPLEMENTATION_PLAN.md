@@ -3,94 +3,89 @@
 **Jira Ticket:** [IDRE-505](https://orchidsoftware.atlassian.net//browse/IDRE-505)
 
 ## Summary
-Create a one-off database script to fix dispute DISP-4565537 by removing the IP as the prevailing party, deleting the IP's refund, and reverting the case status to Final Determination Pending.
+Create a one-off data correction script to adjust the prevailing party to the NIP, remove the incorrect refund to the IP, and update the case status to Final Determination Pending for case DISP-4565537.
 
 ## Implementation Plan
 
-**Step 1: Create database correction script for DISP-4565537**  
-Create a standalone executable script using Prisma to correct the dispute DISP-4565537. The script should:
-1. Accept an `--apply` flag for dry-run capability.
-2. Look up the `Case` by `disputeReferenceNumber` 'DISP-4565537'.
-3. Identify the refund `Payment` (and associated `CaseRefund`) for the Initiating Party (IP) and delete them.
-4. Update the `ArbitrationDecision` for the case to remove the IP as the prevailing party (e.g., set `awardRecipient` to null or delete the decision record).
-5. Update the `Case` status to `CaseStatus.FINAL_DETERMINATION_PENDING`.
-6. Execute all database mutations within a `prisma.$transaction` to ensure atomicity.
-Files: `scripts/fix-disp-4565537-prevailing-party.ts`
+**Step 1: Create data correction script for DISP-4565537**  
+Create a new one-off data correction script `scripts/fix-disp-4565537.ts`. The script should use Prisma to execute a transaction that: 1) Finds the Case by reference 'DISP-4565537' and retrieves its IP, NIP, DisputeLineItems, and Payments. 2) Identifies and deletes (or voids) the refund `Payment` and associated `PaymentAllocation` records for the Initiating Party (IP). 3) Updates the `DisputeLineItem` records (and Case if applicable) to change the prevailing party from the IP to the Non-Initiating Party (NIP). 4) Updates the Case `status` to `FINAL_DETERMINATION_PENDING`.
+Files: `scripts/fix-disp-4565537.ts`
 
-**Risk Level:** LOW — The change is isolated to a single specific case via a targeted script. Using a dry-run mode and a database transaction ensures that the operation can be verified before committing and won't leave the case in a partially updated state.
+**Risk Level:** LOW — The change is a targeted data correction for a single case (DISP-4565537) using a standalone script. It does not modify any application logic or schema, resulting in minimal risk to the overall system.
 
 **Deployment Notes:**
-- The script should be executed in the production environment using `npx tsx scripts/fix-disp-4565537-prevailing-party.ts --apply` after verifying the dry-run output.
+- The script needs to be executed manually in the production environment (e.g., via ts-node or a designated script runner) to apply the data correction.
 
 ## Proposed Code Changes
 
-### `scripts/fix-disp-4565537-prevailing-party.ts` (create)
-This script fulfills the ticket requirements by targeting the specific dispute (`DISP-4565537`), deleting the incorrect refund and payment records for the Initiating Party, removing the arbitration decision to clear the prevailing party, and reverting the case status to `FINAL_DETERMINATION_PENDING`. It includes a dry-run mode to safely test the logic before applying changes.
+### `scripts/fix-disp-4565537.ts` (create)
+This script fulfills the requirements of the ticket by executing a transaction that removes the incorrect refund to the IP, updates the prevailing party on the dispute line items to the NIP, and sets the case status back to `FINAL_DETERMINATION_PENDING`.
 ```typescript
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, CaseStatus, PaymentType } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
 async function main() {
-  const args = process.argv.slice(2);
-  const isDryRun = !args.includes("--apply");
+  const caseReference = 'DISP-4565537';
 
-  console.log(`Starting fix for DISP-4565537...`);
-  if (isDryRun) {
-    console.log(`DRY RUN MODE: No changes will be committed. Use --apply to execute.`);
-  } else {
-    console.log(`APPLY MODE: Changes will be committed to the database.`);
-  }
+  console.log(`Starting data correction for case ${caseReference}...`);
 
-  const disputeReferenceNumber = "DISP-4565537";
-
-  try {
-    await prisma.$transaction(async (tx) => {
-      // 1. Find the case
-      const caseRecord = await tx.case.findUnique({
-        where: { disputeReferenceNumber },
-        include: {
-          parties: true,
-          refunds: true,
+  await prisma.$transaction(async (tx) => {
+    // 1. Find the Case
+    const caseRecord = await tx.case.findUnique({
+      where: { reference: caseReference },
+      include: {
+        initiatingParty: true,
+        nonInitiatingParty: true,
+        DisputeLineItems: true,
+        paymentAllocations: {
+          include: {
+            payment: true,
+          },
         },
-      });
+      },
+    });
 
-      if (!caseRecord) {
-        throw new Error(`Case with reference ${disputeReferenceNumber} not found.`);
-      }
+    if (!caseRecord) {
+      throw new Error(`Case ${caseReference} not found`);
+    }
 
-      console.log(`Found case: ${caseRecord.id} (Current status: ${caseRecord.status})`);
+    const ipId = caseRecord.initiatingPartyId;
+    const nipId = caseRecord.nonInitiatingPartyId;
 
-      // 2. Identify IP party
-      const ipParty = caseRecord.parties.find((p) => p.partyType === "INITIATING_PARTY");
-      if (!ipParty) {
-        throw new Error("Initiating Party not found for this case.");
-      }
+    if (!ipId || !nipId) {
+      throw new Error(`Case ${caseReference} is missing IP or NIP`);
+    }
 
-      // 3. Find IP refund
-      const ipRefunds = caseRecord.refunds.filter((r) => r.partyId === ipParty.id);
-      
-      for (const refund of ipRefunds) {
-        console.log(`Found IP refund to delete: ${refund.id}`);
+    console.log(`Found case ${caseRecord.id}`);
+    console.log(`IP ID: ${ipId}`);
+    console.log(`NIP ID: ${nipId}`);
+
+    // 2. Identify and delete the refund Payment and associated PaymentAllocation records for the IP
+    const ipRefundAllocations = caseRecord.paymentAllocations.filter(
+      (pa) => pa.payment.type === PaymentType.REFUND && pa.partyId === ipId
+    );
+
+    if (ipRefundAllocations.length === 0) {
+      console.log('No refund allocations found for IP. Skipping refund deletion.');
+    } else {
+      for (const allocation of ipRefundAllocations) {
+        console.log(`Deleting PaymentAllocation ${allocation.id} and Payment ${allocation.paymentId}`);
         
-        if (!isDryRun) {
-          // Delete CaseRefund first due to foreign key constraints
-          await tx.caseRefund.delete({
-            where: { id: refund.id },
-          });
-          
-          // Delete associated Payment if it exists
-          if (refund.paymentId) {
-            await tx.payment.delete({
-              where: { id: refund.paymentId },
-            });
-            console.log(`Deleted associated payment: ${refund.paymentId}`);
-          }
-        }
-      }
+        // Delete the allocation
+        await tx.paymentAllocation.delete({
+          where: { id: allocation.id },
+        });
 
-      // 4. Remove ArbitrationDecision to clear the prevailing party
-      console.log(`Remo
+        // Delete the payment
+        await tx.payment.delete({
+          where: { id: allocation.paymentId },
+        });
+      }
+    }
+
+    // 3. Update the DisputeLineItem records to change the prevailing party from the IP to the NIP
+    const lineIte
 ... (truncated — see full diff in files)
 ```
 
@@ -99,16 +94,10 @@ async function main() {
 
 ## Test Suggestions
 
-Framework: `Jest or Vitest`
+Framework: `Jest`
 
-- **shouldNotModifyDatabaseWhenRunningInDryRunMode** — Ensures the script safely logs intended actions without mutating the database when dry-run mode is active.
-- **shouldApplyDatabaseFixesWhenDryRunIsDisabled** — Validates the happy path execution of the script, ensuring all three requirements (remove IP prevailing party, remove refund, change status) are executed.
-- **shouldExitGracefullyIfDisputeIsNotFound** *(edge case)* — Ensures the script handles the edge case where the target dispute does not exist in the environment being run against.
-
-## Confluence Documentation References
-
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — Highlights the complexity and risks associated with manual cleanup of payments, refunds, and status transitions, which is exactly what this DB change entails.
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — Serves as the canonical reference for the case lifecycle, which is relevant when reverting a case status to 'Final Determination Pending' and adjusting the prevailing party.
+- **should execute transaction to update dispute DISP-4565537 correctly** — Verifies that the script performs the exact database updates required by the ticket.
+- **should handle database errors and exit with code 1** *(edge case)* — Ensures the script handles database failures gracefully without leaving the process hanging or failing silently.
 
 ## AI Confidence Scores
 Plan: 95%, Code: 95%, Tests: 90%

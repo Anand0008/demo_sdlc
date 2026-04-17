@@ -3,76 +3,68 @@
 **Jira Ticket:** [IDRE-458](https://orchidsoftware.atlassian.net//browse/IDRE-458)
 
 ## Summary
-Fix the role-based access logic for the 'Payment processing' tab in the payments dashboard to ensure authorized users can access it.
+Update the role-based access control (RBAC) checks to allow authorized users to access the Payment processing tab.
 
 ## Implementation Plan
 
-**Step 1: Update server-side permission flags for PaymentsClient**  
-Review the role-based permission flags (such as `isVtSupportRole(session.user.role)`) computed in the server component and passed to `PaymentsClient`. Ensure that the correct authorization flag for accessing the payment processing features is accurately evaluated and includes all necessary user roles (e.g., admins, managers).
-Files: `app/dashboard/payments/page.tsx`
+**Step 1: Update UI Role Check for Payment Processing Tab**  
+Locate the conditional rendering logic or role guard that restricts access to the Payment processing tab/form. Update the RBAC check to include the appropriate user roles (e.g., allowing regular organization members with billing permissions, rather than just owners/admins) so they can access the tab.
+Files: `app/app/payments/components/payment-form-section.tsx`, `app/app/payments/components/payment-form.tsx`
 
-**Step 2: Fix conditional rendering of Payment processing tab**  
-Locate the `TabsTrigger` and `TabsContent` for the 'Payment processing' tab. Update the conditional rendering or `disabled` state logic to use the corrected permission flags passed from the server, ensuring that authorized users can successfully view and interact with the tab.
-Files: `app/dashboard/payments/payments-client.tsx`
+**Step 2: Align Backend Authorization with UI Permissions**  
+Review and update the authorization checks in the backend action to ensure that users with the newly permitted roles can successfully fetch the required case and payment details without encountering unauthorized errors.
+Files: `lib/actions/party-case-details.ts`
 
-**Risk Level:** LOW — The changes are limited to UI conditional rendering and client-side role checks for a specific tab, which carries minimal risk of impacting other system functionality.
+**Risk Level:** LOW — The changes are limited to adjusting role-based access control conditions in the UI and corresponding backend actions. As long as the correct roles are specified, the risk of unintended side effects is minimal.
+
+**Deployment Notes:**
+- Ensure that relaxing the RBAC for the payment processing tab aligns with the business requirements for who is allowed to process payments.
 
 ## Proposed Code Changes
 
-### `app/dashboard/payments/page.tsx` (modify)
-Compute a new `canProcessPayments` flag on the server that includes admins and managers, and pass it to the client component.
+### `app/app/payments/components/payment-form-section.tsx` (modify)
+Allow regular organization members to view and access the payment form section, rather than restricting it to just owners and admins.
 ```
-@@ -...@@
-   const session = await getCachedSession();
-   if (!session?.user) {
-     redirect("/login");
-   }
- 
-   const isVtSupport = isVtSupportRole(session.user.role);
-+  const canProcessPayments = isVtSupport || session.user.role === "ADMIN" || session.user.role === "MANAGER";
- 
-@@ -...@@
-       <PaymentsClient
-         isVtSupport={isVtSupport}
-+        canProcessPayments={canProcessPayments}
+--- a/app/app/payments/components/payment-form-section.tsx
++++ b/app/app/payments/components/payment-form-section.tsx
+@@ -15,3 +15,3 @@
+-  const isAuthorized = role === "owner" || role === "admin";
++  const isAuthorized = role === "owner" || role === "admin" || role === "member";
 ```
 
-### `app/dashboard/payments/payments-client.tsx` (modify)
-Update the `PaymentsClient` to accept the new `canProcessPayments` prop and use it to conditionally render the Payment processing tab and its content, ensuring authorized users can access it.
+### `app/app/payments/components/payment-form.tsx` (modify)
+Update the role guard in the payment form component to permit members to process payments.
 ```
-@@ -...@@
- interface PaymentsClientProps {
-   // ... existing props
-   isVtSupport: boolean;
-+  canProcessPayments?: boolean;
- }
- 
- export default function PaymentsClient({
-   // ... existing props
-   isVtSupport,
-+  canProcessPayments = false,
- }: PaymentsClientProps) {
-@@ -...@@
--            {isVtSupport && (
-+            {(isVtSupport || canProcessPayments) && (
-               <TabsTrigger value="processing"
-@@ -...@@
--            {isVtSupport && (
-+            {(isVtSupport || canProcessPayments) && (
-               <TabsContent value="processing"
+--- a/app/app/payments/components/payment-form.tsx
++++ b/app/app/payments/components/payment-form.tsx
+@@ -20,3 +20,3 @@
+-  const canProcessPayment = ["owner", "admin"].includes(userRole);
++  const canProcessPayment = ["owner", "admin", "member"].includes(userRole);
+```
+
+### `lib/actions/party-case-details.ts` (modify)
+Align backend authorization with the updated UI permissions so that members can successfully fetch case and payment details without encountering unauthorized errors.
+```typescript
+--- a/lib/actions/party-case-details.ts
++++ b/lib/actions/party-case-details.ts
+@@ -80,3 +80,3 @@
+-    if (membership?.role !== "owner" && membership?.role !== "admin") {
++    if (membership?.role !== "owner" && membership?.role !== "admin" && membership?.role !== "member") {
+       throw new Error("Unauthorized to view payment details");
+     }
 ```
 
 ## Test Suggestions
 
-Framework: `Vitest with React Testing Library`
+Framework: `Vitest`
 
-- **shouldRenderPaymentProcessingTabWhenAuthorized** — Verifies that the Payment processing tab is visible when the user has the correct permissions.
-- **shouldNotRenderPaymentProcessingTabWhenUnauthorized** — Regression test for IDRE-458: Verifies that the Payment processing tab is hidden for unauthorized users.
-- **shouldComputeCanProcessPaymentsTrueForAdminAndManager** — Verifies that the server component correctly computes the authorization flag for admins and managers.
-- **shouldComputeCanProcessPaymentsFalseForStandardUsers** — Verifies that the server component correctly restricts the authorization flag for standard users.
+- **shouldRenderPaymentFormSectionForMemberRole** — Verifies that regular organization members can view the payment form section, fixing the bug where they were restricted.
+- **shouldRenderPaymentFormForMemberRole** — Ensures the role guard inside the payment form permits members to process payments.
+- **shouldFetchPartyCaseDetailsForMemberRole** — Validates that the backend authorization aligns with the UI permissions, allowing members to fetch case details.
+- **shouldDenyAccessToPartyCaseDetailsForUnauthorizedRoles** *(edge case)* — Ensures that while members are allowed, truly unauthorized roles are still blocked from fetching case details.
 
 ## AI Confidence Scores
-Plan: 85%, Code: 95%, Tests: 95%
+Plan: 75%, Code: 80%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

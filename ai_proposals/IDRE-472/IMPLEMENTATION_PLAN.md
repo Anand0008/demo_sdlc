@@ -3,87 +3,72 @@
 **Jira Ticket:** [IDRE-472](https://orchidsoftware.atlassian.net//browse/IDRE-472)
 
 ## Summary
-Fix role permissions to allow UHC users to view the Payments tab and enable internal users to manage UHC users.
+Fix access control issues preventing UHC users from viewing the Payments tab and internal users from managing them by updating route permissions and role hierarchies.
 
 ## Implementation Plan
 
-**Step 1: Update Role Definitions and Hierarchy**  
-Ensure the UHC user role (e.g., 'party-user', 'uhc-user', or similar) is correctly classified in `isPartyRole` and included in the role hierarchy so internal users (like admins or support) can manage them via `getManageableRoles`.
-Files: `lib/auth/roles.ts`, `lib/auth/client-utils.ts`
-
-**Step 2: Update Route Permissions for Payments Tab**  
-Add the UHC user role to the `allowedRoles` array for the `/app/payments` (or `/dashboard/payments`) route in `routePermissions` to grant them access to the Payments tab.
+**Step 1: Grant 'party' role access to Payments route**  
+Update the `routePermissions` configuration for `/dashboard/payments` to include the `party` role (or the specific role assigned to UHC users) in the `allowedRoles` array.
 Files: `lib/auth/route-permissions-config.ts`
 
-**Step 3: Verify Sidebar Navigation Logic**  
-Verify that the sidebar navigation correctly displays the 'Payments' tab for the UHC user role, adjusting the `isPartyRole` check or navigation array if necessary.
-Files: `components/app-sidebar.tsx`
+**Step 2: Allow internal users to manage 'party' role**  
+Update `getManageableRoles` or `roleHierarchy` to ensure that internal users (e.g., `admin-support`, `case-manager`) have the authority to manage the `party` role.
+Files: `lib/auth/client-utils.ts`, `lib/auth/permissions.ts`
 
-**Risk Level:** LOW — Changes are limited to role-based access control configurations and do not affect core business logic or database schemas.
+**Risk Level:** LOW — The changes are limited to role-based access control configurations. Adding a role to an allowed list or hierarchy is a low-risk operation that only affects authorization checks.
 
 ## Proposed Code Changes
 
 ### `lib/auth/route-permissions-config.ts` (modify)
-Adds party roles to the allowed roles for the `/dashboard/payments` route so UHC users (who are party users) can view the Payments tab.
+Adding the `party` role to the `allowedRoles` array for `/dashboard` and `/dashboard/payments` ensures that UHC users (who are assigned the `party` role) can successfully navigate to and view the Payments tab.
 ```typescript
 --- a/lib/auth/route-permissions-config.ts
 +++ b/lib/auth/route-permissions-config.ts
-@@ -100,6 +100,8 @@
-   "/dashboard/payments": {
-     allowedRoles: [
-       "master-admin",
-       "admin-support",
-       "payment-admin",
-       "payment-specialist",
+@@ -16,6 +16,7 @@
+       "appeals-manager",
+       "capitol-bridge-admin",
+       "vt-support",
++      "party",
+     ],
+     description: "Main dashboard access",
+   },
+@@ -50,6 +51,7 @@
        "accounting",
        "view-only",
        "capitol-bridge-admin",
        "vt-support",
-+      "party-user",
-+      "party-admin",
++      "party",
      ],
      description: "Payments dashboard",
    },
 ```
 
-### `lib/auth/client-utils.ts` (modify)
-Ensures that internal users (like `admin-support`) can manage `party-user` and `party-admin` roles by adding them to the list of manageable roles returned by `getManageableRoles`.
+### `lib/auth/permissions.ts` (modify)
+Adding `party` to the `roleHierarchy` with a low authority level (10) ensures that internal users with higher authority levels (like `admin-support` or `case-manager`) are able to manage users with the `party` role via the `getAvailableRoles` / `getManageableRoles` utilities.
 ```typescript
---- a/lib/auth/client-utils.ts
-+++ b/lib/auth/client-utils.ts
-@@ -80,6 +80,8 @@
-       "arbitrator-manager",
-       "appeals-manager",
-       "capitol-bridge-admin",
-       "vt-support",
-+      "party-user",
-+      "party-admin",
-     ];
-   }
+--- a/lib/auth/permissions.ts
++++ b/lib/auth/permissions.ts
+@@ -20,6 +20,7 @@
+   "attorney": 60,
+   "view-only": 50,
+   "vt-support": 50,
++  "party": 10,
+ };
 ```
 
-### `components/app-sidebar.tsx` (modify)
-Removes any hardcoded restrictions in the sidebar that might be hiding the Payments tab for party users, relying instead on the centralized `routePermissions` configuration.
-```
---- a/components/app-sidebar.tsx
-+++ b/components/app-sidebar.tsx
-@@ -50,7 +50,6 @@
-   const navItems = getNavigationForRole(userRole).filter(item => {
--    if (isPartyRole(userRole) && item.name === "Payments") return false;
-     return item.available;
-   });
-```
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
-Framework: `Vitest / Jest`
+Framework: `Jest or Vitest`
 
-- **shouldAllowPartyRolesToAccessPaymentsRoute** — Verifies that party roles (UHC users) are granted access to the payments route configuration.
-- **shouldIncludePartyRolesInManageableRolesForInternalUsers** — Ensures that internal users have the necessary permissions to manage UHC (party) users.
-- **shouldRenderPaymentsTabForPartyUsers** — Verifies that the AppSidebar correctly renders the Payments tab for party users now that hardcoded restrictions are removed.
+- **should allow party role access to dashboard and payments routes** — Verifies that the 'party' role is granted access to the dashboard and payments routes, fixing the bug where UHC users could not view the Payments tab.
+- **should allow higher authority internal roles to manage the party role** — Verifies that internal users with higher authority levels can successfully manage users assigned the 'party' role.
+- **should define party role with authority level 10 in role hierarchy** — Verifies that the 'party' role is correctly registered in the role hierarchy with a low authority level (10).
 
 ## AI Confidence Scores
-Plan: 80%, Code: 85%, Tests: 95%
+Plan: 80%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

@@ -3,106 +3,50 @@
 **Jira Ticket:** [IDRE-507](https://orchidsoftware.atlassian.net//browse/IDRE-507)
 
 ## Summary
-Add a temporary master-admin server action to reverse the NACHA payments for disputes DISP-4651304 and DISP-4825798, updating their status to FAILED so refunds can be issued via the UI.
+Create a data fix script to reverse NACHA payments and issue refunds for disputes DISP-4651304 and DISP-4825798.
 
 ## Implementation Plan
 
-**Step 1: Add temporary DB fix action for NACHA disputes**  
-Add a temporary master-admin server action `fixIdre507NachaDisputes` to `lib/actions/nacha-debug.ts`. This action will use Prisma to query for `Case` records with `disputeReferenceNumber` 'DISP-4651304' and 'DISP-4825798'. It will find their associated `Payment` records that are currently marked as `PAID` (specifically those linked to the NACHA batch ending in 6f21ac09, if batch relations exist). The action will update these payments' `status` to `FAILED` (or the appropriate reverting status) and append a note indicating they were removed at the bank level. This will revert the ledger balance, allowing the users to issue the required refunds via the standard UI.
-Files: `lib/actions/nacha-debug.ts`
+**Step 1: Create data fix script for NACHA refunds**  
+Create a standalone Prisma script to handle the data fix. The script must: 1) Find the `Payment` records associated with disputes DISP-4651304 and DISP-4825798 that were included in NACHA batch `6f21ac09`. 2) Update the status of these original payments to `FAILED` or `CANCELLED` to reverse the NACHA transaction. 3) Create new `Payment` records with `PaymentType.REFUND` and `PaymentDirection.OUTBOUND` to credit the respective accounts, ensuring the correct refund target account logic is respected.
+Files: `scripts/IDRE-507-refund-nacha-disputes.ts`
 
-**Risk Level:** LOW — The change is isolated to a master-admin debug file and specifically targets the two dispute reference numbers mentioned in the ticket, minimizing the risk of unintended side effects on other payments.
+**Risk Level:** LOW — The change is a targeted data fix script affecting only two specific disputes. It does not modify application code, minimizing the risk of regressions.
 
 **Deployment Notes:**
-- The temporary action should be executed by a master-admin in production, and then the code can be removed in a subsequent cleanup PR.
+- The script should be run in a dry-run mode first to verify the correct records are targeted before committing the transaction.
 
 ## Proposed Code Changes
 
-### `lib/actions/nacha-debug.ts` (modify)
-Added a temporary server action `fixIdre507NachaDisputes` to find the `PAID` payments associated with the specified disputes and update their status to `FAILED` with an explanatory note. This will revert the ledger balance and allow the users to issue refunds via the standard UI.
+### `scripts/IDRE-507-refund-nacha-disputes.ts` (create)
+No rationale provided
 ```typescript
---- a/lib/actions/nacha-debug.ts
-+++ b/lib/actions/nacha-debug.ts
-@@ -90,3 +90,56 @@
-     };
-   }
- }
-+
-+export async function fixIdre507NachaDisputes(): Promise<ActionResult<any>> {
-+  try {
-+    const session = await auth.api.getSession({
-+      headers: await headers(),
-+    });
-+
-+    if (!session || session.user.role !== 'master-admin') {
-+      return {
-+        success: false,
-+        error: 'Unauthorized - master-admin access required'
-+      };
-+    }
-+
-+    const disputes = ['DISP-4651304', 'DISP-4825798'];
-+
-+    const payments = await prisma.payment.findMany({
-+      where: {
-+        status: 'PAID',
-+        caseAllocations: {
-+          some: {
-+            case: {
-+              disputeReferenceNumber: {
-+                in: disputes
-+              }
-+            }
-+          }
-+        }
-+      }
-+    });
-+
-+    if (payments.length === 0) {
-+      return {
-+        success: false,
-+        error: 'No PAID payments found for the specified disputes.'
-+      };
-+    }
-+
-+    const updated = await Promise.all(
-+      payments.map(payment => 
-+        prisma.payment.update({
-+          where: { id: payment.id },
-+          data: {
-+            status: 'FAILED',
-+            notes: payment.notes 
-+              ? `${payment.notes}\n[IDRE-507] Payment removed at bank level (not paid from NACHA batch 6f21ac09). Status reverted to FAILED to allow refund.`
-+              : '[IDRE-507] Payment removed at bank level (not paid from NACHA batch 6f21ac09). Status reverted to FAILED to allow refund.'
-+          }
-+        })
-+      )
-+    );
-+
-+    return {
-+      success: true,
-+      data: {
-+        message: `Updated ${updated.length} payments to FAILED`,
-+        updatedPaymentIds: updated.map(p => p.id)
-+      }
-+    };
-+  } catch (error) {
-+    console.error('Error in fixIdre507NachaDisputes:', error);
-+    return {
-+      success: false,
-+      error: error instanceof Error ? error.message : 'Unknown error'
-+    };
-+  }
-+}
+console.log(`\nProcessing dispute: ${disputeNumber}`);
+// Find the case/dispute
+const caseRecord = await prisma.case.findFirst({
+where: { caseNumber: disputeNumber }
+});
+if (!caseRecord) {
+console.log(`Could not find case with caseNumber ${disputeNumber}`);
+continue;
+}
+// Find payments for this case
+const payments = await prisma.payment.findMany({
+where: {
+case
 ```
 
 ## Test Suggestions
 
-Framework: `Vitest`
+Framework: `Jest`
 
-- **should successfully update the specified dispute payments to FAILED** — Verifies that the server action successfully reverses the NACHA payments for the specified disputes when executed by a master-admin.
-- **should throw an unauthorized error if the user is not a master-admin** *(edge case)* — Ensures that the temporary server action is strictly protected and cannot be executed by non-master-admin users.
-- **should handle cases where the target payments are not found or not in PAID status** *(edge case)* — Verifies the behavior when the target payments are not found or are no longer in the PAID status.
+- **should successfully credit account and issue refunds for target disputes** — Verifies the happy path where both disputes are successfully found, credited, and refunded.
+- **should throw an error if a target dispute is not found in the database** *(edge case)* — Ensures the script handles missing records gracefully without crashing unexpectedly or applying partial credits.
+- **should skip processing if the disputes are already marked as refunded** *(edge case)* — Verifies that the script is idempotent and will not double-refund the disputes if run multiple times.
+
+## Confluence Documentation References
+
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — Provides critical operational constraints regarding payment and refund state changes, warning that manual adjustments must account for case status transitions and refund target account logic.
 
 ## AI Confidence Scores
 Plan: 90%, Code: 95%, Tests: 90%

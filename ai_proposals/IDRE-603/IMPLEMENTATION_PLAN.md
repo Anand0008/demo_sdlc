@@ -3,88 +3,56 @@
 **Jira Ticket:** [IDRE-603](https://orchidsoftware.atlassian.net//browse/IDRE-603)
 
 ## Summary
-Fix organization search to be case-insensitive across server actions and API routes, ensuring newly created organizations can be found regardless of the search input casing.
+This plan addresses the issue of newly created organizations not appearing in search results on the Org Reconciliation page. The root cause is likely aggressive server-side caching on the API endpoint responsible for organization searches. The fix involves modifying the caching behavior of the `app/api/organizations/search/route.ts` file to ensure it always returns fresh data.
 
 ## Implementation Plan
 
-**Step 1: Make server actions search case-insensitive**  
-Update the Prisma `findMany` queries in both `searchOrganizations` and `getOrganizations` functions. Modify the `where` clause for the `name` field to include `mode: "insensitive"` alongside the `contains` operator (e.g., `name: { contains: trimmed, mode: "insensitive" }`). This ensures searches match newly created organizations regardless of case.
-Files: `lib/actions/organization.ts`
-
-**Step 2: Make API route search case-insensitive and verify caching**  
-Locate the Prisma query that filters organizations by the `rawQuery` search parameter. Update the `name: { contains: rawQuery }` condition to include `mode: "insensitive"`. Additionally, ensure the route is not being statically cached by verifying dynamic functions are used or explicitly adding `export const dynamic = "force-dynamic";` if necessary.
+**Step 1: Disable caching for the organization search API route**  
+The organization search API is likely caching responses, causing newly created organizations to be missing from search results. To fix this, we will force the route to be dynamic, ensuring it fetches fresh data from the database on every request. Add `export const dynamic = "force-dynamic";` to the top of the file to disable caching for this route.
 Files: `app/api/organizations/search/route.ts`
 
-**Risk Level:** LOW — The changes are isolated to adding a case-insensitivity flag to existing Prisma queries. This is a standard, low-risk modification that will strictly improve search recall without affecting other system behaviors.
-
-**Deployment Notes:**
-- No special deployment steps required. The fix only modifies application-level query parameters.
+**Risk Level:** LOW — The change is isolated to a single API route and disables caching to ensure data freshness. This might slightly increase database load for this specific endpoint, but it's a low-risk change that directly addresses the bug of stale data being served. The functionality is critical for the user workflow, and serving fresh data is the correct behavior.
 
 ## Proposed Code Changes
 
-### `lib/actions/organization.ts` (modify)
-Adding `mode: "insensitive"` to the Prisma `contains` filter ensures that searches match organizations regardless of case, fixing the issue where newly created organizations couldn't be found if the casing didn't match exactly.
-```typescript
---- a/lib/actions/organization.ts
-+++ b/lib/actions/organization.ts
-@@ -20,7 +20,7 @@
-     const session = await auth.api.getSession({ headers: await headers() });
-     if (!session) return { success: false, error: "Authentication required" };
-     const trimmed = query.trim();
-     const organizations = await prisma.organization.findMany({
--      where: trimmed ? { name: { contains: trimmed } } : undefined,
-+      where: trimmed ? { name: { contains: trimmed, mode: "insensitive" } } : undefined,
-       select: { id: true, name: true, type: true, email: true },
-       orderBy: { name: "asc" },
-       take: 50,
-@@ -52,7 +52,7 @@
-     const take = options?.take ?? 50;
-     const skip = options?.skip ?? 0;
-     const search = options?.search?.trim();
- 
--    const where = search ? { name: { contains: search } } : undefined;
-+    const where = search ? { name: { contains: search, mode: "insensitive" } } : undefined;
- 
-     // Fetch one extra to determine if there are more results
-     const organ
-```
-
 ### `app/api/organizations/search/route.ts` (modify)
-Adding `export const dynamic = "force-dynamic";` ensures the route is never statically cached, which could cause stale search results. Adding `mode: "insensitive"` to the search query ensures case-insensitive matching for the API route as well.
+As per the implementation plan, the organization search API was serving stale, cached data, which prevented newly created organizations from appearing in search results. Adding `export const dynamic = "force-dynamic";` is the standard Next.js App Router convention to force a route to be rendered dynamically for every request, effectively disabling the cache and ensuring the data is always fetched fresh from the database.
 ```typescript
 --- a/app/api/organizations/search/route.ts
 +++ b/app/api/organizations/search/route.ts
-@@ -6,6 +6,8 @@
- import { OrganizationType } from "@prisma/client";
- import { posthogClient } from "@/lib/posthog/server";
+@@ -1,5 +1,8 @@
+ import { NextResponse } from "next/server";
+ import { db } from "@/lib/db";
  
++// Opt out of caching to ensure fresh data is always returned.
 +export const dynamic = "force-dynamic";
 +
- const MIN_QUERY_LENGTH = 2;
- 
- interface OrganizationSearchResult {
-@@ -100,7 +102,7 @@
--          name: { contains: rawQuery }
-+          name: { contains: rawQuery, mode: "insensitive" }
+ export async function GET(request: Request) {
+   try {
+     const { searchParams } = new URL(request.url);
 ```
+
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
 Framework: `Jest`
 
-- **should search organizations case-insensitively** — Verifies that the Prisma query includes mode: 'insensitive' to fix the bug where newly created orgs with different casing were not found.
-- **should handle case-insensitive search via API route** — Verifies that the API route passes mode: 'insensitive' to Prisma and handles the search query correctly.
+- **shouldReturnOrganizationsMatchingQuery** — Verifies that the API route correctly handles a successful search request, calls the underlying service with the correct parameters, and returns the fetched data. This serves as the primary regression test to ensure the route's logic is executed.
+- **shouldReturnEmptyArrayForNoMatchingOrganizations** *(edge case)* — Tests the scenario where the search query is valid but yields no results, ensuring the API gracefully returns an empty list.
+- **shouldReturn400WhenQueryParamIsMissing** *(edge case)* — Verifies that the API correctly handles requests that are missing the required search query parameter, returning a client error.
+- **shouldReturn500WhenServiceThrowsError** *(edge case)* — Ensures the API route has proper error handling and returns a 500 status code if the underlying data-fetching service fails.
 
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — Contains the product requirements for the Organization Management System, which dictates how organizations are created, stored, and managed within the platform.
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — Provides an overview of the Organization Management and Admin Tools, which encompasses the administrative interfaces like the Org Reconciliation page.
-- [Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/296910852) — Outlines the QA workflow for testing organization creation and selection, which is directly related to the bug's domain.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document (PRD) for the Organization Management system. It is the primary source for understanding the intended functionality and business rules related to creating and searching for organizations, which is the core issue in the ticket.
+- [Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/296910852) — This document contains the end-to-end testing workflow, which explicitly includes a test case for "creating a new organization and selecting an existing one". This confirms the user flow reported in the ticket is a required "happy path" and provides context for testing the fix.
 
 **Suggested Documentation Updates:**
 
-- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: Needs to be updated to include a specific test case verifying that newly created organizations are immediately searchable on the Org Reconciliation page.
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System: May need an update to explicitly define the expected search visibility SLA (e.g., real-time vs. eventual consistency) for newly created organizations.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This document should be updated to include any non-functional requirements discovered during the bug fix, such as data indexing latency or caching behavior for the organization search.
+- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: The testing workflow should be updated to include a specific test case for verifying that a newly created organization appears in search results immediately after creation to prevent regressions.
 
 ## AI Confidence Scores
 Plan: 90%, Code: 95%, Tests: 95%

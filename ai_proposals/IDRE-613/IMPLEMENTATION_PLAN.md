@@ -3,37 +3,58 @@
 **Jira Ticket:** [IDRE-613](https://orchidsoftware.atlassian.net//browse/IDRE-613)
 
 ## Summary
-Fix the organization search API to ensure eligible main organizations are returned when searching for a parent organization to reassign a sub-organization to.
+This plan resolves the bug that prevents reassigning a sub-organization to a main organization. The root cause is improper permission checking that does not account for organization hierarchies. The fix involves updating the `getCaseDetails` server action in `lib/actions/party-case-details.ts` to include sub-organizations when determining a user's access to cases. This will allow the permission checks to pass, unblocking the reassignment operation.
 
 ## Implementation Plan
 
-**Step 1: Fix organization search filtering for parent organizations**  
-Update the search logic in the GET handler to ensure that eligible main organizations are correctly returned in the search results. Check for and fix any overly restrictive filtering conditions (such as incorrectly excluding organizations that already have sub-organizations or filtering by incorrect organization types) that prevent users from finding and selecting the target main organization during the reassignment process.
-Files: `app/api/organizations/search/route.ts`
+**Step 1: Modify `getCaseDetails` to recognize sub-organization relationships**  
+Update the `getCaseDetails` function to correctly determine a user's organizational access by including sub-organizations. This will fix permission checks that currently fail when trying to manage sub-organizations. First, after fetching the user's direct organization IDs into the `orgIds` constant, add a Prisma query to fetch the IDs of all sub-organizations belonging to those direct organizations. Then, combine the direct and sub-organization IDs into a new `allOrgIds` array, ensuring uniqueness. Finally, in the `whereClause` for the `prisma.case.findFirst` call, replace `orgIds` with `allOrgIds` to ensure cases related to sub-organizations are included in the access check.
+Files: `lib/actions/party-case-details.ts`
 
-**Risk Level:** LOW — The change is isolated to the organization search API endpoint. The risk is low as it only affects the visibility of organizations in search results, but care must be taken to ensure that unauthorized or invalid organizations are not exposed.
+**Risk Level:** LOW — The change is confined to a single server action and expands data visibility in a logical way that reflects the intended organizational hierarchy. This is a low-risk bug fix that is unlikely to cause negative side effects.
 
 ## Proposed Code Changes
 
-### `app/api/organizations/search/route.ts` (modify)
-The issue prevents users from reassigning a sub-organization to a main organization because the search API filters out eligible main organizations (likely by restricting `parentId` to `null` or requiring `subOrganizations` to be empty). By explicitly overriding `parentId` and `subOrganizations` to `undefined` in the Prisma `where` clause, we ensure these restrictive filters are ignored, allowing all eligible organizations to be returned in the search results.
+### `lib/actions/party-case-details.ts` (modify)
+As per the implementation plan, the `getCaseDetails` function was only checking for cases associated with the user's direct organizations. This change extends the logic to also fetch and include all sub-organizations of the user's organizations. By using the combined list of direct and sub-organization IDs (`allOrgIds`) in the case query, we ensure that permission checks correctly account for the organizational hierarchy, resolving the bug that blocked the reassignment of sub-organizations.
 ```typescript
---- a/app/api/organizations/search/route.ts
-+++ b/app/api/organizations/search/route.ts
-@@ -25,7 +25,12 @@
-     // ... existing where clause construction ...
+--- a/lib/actions/party-case-details.ts
++++ b/lib/actions/party-case-details.ts
+@@ -30,18 +30,29 @@
+     });
  
-     const organizations = await prisma.organization.findMany({
--      where,
+     const orgIds = memberships.map((m) => m.organizationId);
++
++    // Also find all sub-organizations of the user's organizations
++    const subOrgs = await prisma.organization.findMany({
 +      where: {
-+        ...where,
-+        // FIX (IDRE-613): Remove overly restrictive filtering conditions that prevent selecting existing main organizations
-+        parentId: undefined,
-+        subOrganizations: undefined,
++        parentId: { in: orgIds },
 +      },
-       take: 20,
-       orderBy: {
-         name: "asc",
++      select: { id: true },
++    });
++    const subOrgIds = subOrgs.map((org) => org.id);
++
++    const allOrgIds = [...new Set([...orgIds, ...subOrgIds])];
+ 
+     // Check both organization-based AND user-based access
+     // This handles cases where users are directly associated or through organizations
+     const whereClause = {
+       id: caseId,
+       OR: [
+         // Direct user association (for backwards compatibility or cases without proper org assignment)
+         { initiatingParty: { userId } },
+         { nonInitiatingParty: { userId } },
+         // Organization-based access (primary method)
+-        ...(orgIds.length > 0
++        ...(allOrgIds.length > 0
+           ? [
+-              { initiatingPartyOrganizationId: { in: orgIds } },
+-              { nonInitiatingPartyOrganizationId: { in: orgIds } },
++              { initiatingPartyOrganizationId: { in: allOrgIds } },
++              { nonInitiatingPartyOrganizationId: { in: allOrgIds } },
+             ]
+           : []),
+       ],
 ```
 
 **New Dependencies:**
@@ -43,22 +64,21 @@ The issue prevents users from reassigning a sub-organization to a main organizat
 
 Framework: `Jest`
 
-- **should return eligible main organizations by overriding parentId and subOrganizations filters** *(edge case)* — Regression test to ensure that main organizations are not filtered out during search, allowing sub-organizations to be reassigned to them.
-- **should return an empty array when no organizations match the search query** — Verifies that the API correctly handles cases where no organizations match the search criteria, while still applying the correct filter overrides.
+- **shouldReturnCaseDetailsWhenUserBelongsToParentOrganization** — This is the primary regression test. It simulates the exact scenario reported in the bug: a user belonging to a parent organization should be able to access resources (cases) owned by a sub-organization. This verifies that the fix correctly includes sub-organization IDs in the permission check.
+- **shouldReturnCaseDetailsWhenUserBelongsToDirectOrganization** — This test verifies that the change does not introduce a regression for the standard "happy path" scenario. Users must still be able to access cases that belong to their direct organization.
 
 ## Confluence Documentation References
 
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — Provides the release overview and administrative tool context for the Organization Management system, which is the domain of the ticket.
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the PRD for the Organization Management System, which defines the business rules and data models for organization hierarchies (main and sub-organizations).
-- [IDRE Platform Weekly Work Summary: April 8, 2026 Updates and Enhancements](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/318275601) — Mentions ongoing work to address edge-case issues in the Organization Management Tool, providing context on the current state of the feature.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This document is the Product Requirements Document (PRD) for the feature area in question. It should contain the definitive business rules, constraints, and expected behavior for managing organizations and sub-organizations, which is essential for resolving the bug.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This page provides an overview of the Organization Management feature as part of a release. It can offer context on the intended functionality and user-facing aspects, which helps in understanding the scope of the bug.
 
 **Suggested Documentation Updates:**
 
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System - May need updating to clarify the business rules and constraints around reassigning sub-organizations to main organizations if they are currently undefined or changing.
-- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview - Might need an update to document the correct administrative workflow for reassigning sub-organizations once the issue is resolved.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This PRD should be reviewed and updated to clarify the specific business rules and validation logic for reassigning a sub-organization. If the rules are ambiguous, this ticket provides an opportunity to refine them.
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: If this page contains user-facing guides on the feature, it will need to be updated to reflect the corrected workflow for reassigning organizations once the bug is fixed.
 
 ## AI Confidence Scores
-Plan: 40%, Code: 85%, Tests: 95%
+Plan: 90%, Code: 85%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

@@ -3,89 +3,112 @@
 **Jira Ticket:** [IDRE-551](https://orchidsoftware.atlassian.net//browse/IDRE-551)
 
 ## Summary
-Fix the IDRE payouts report to include current-day payouts by calculating exact UTC bounds based on the user's local timezone on the frontend and parsing them correctly in the API route.
+The user is unable to see IDRE payouts for the current day because the report's API is filtering payments based on a timestamp that is only set after the NACHA generation process. This plan updates the data-fetching logic in both the report API (`app/api/reports/idre-payouts/route.ts`) and the corresponding export API (`app/api/reports/export/route.ts`). The change involves modifying the Prisma query to filter payments by their creation/completion date, rather than a post-processing date, thereby including same-day payouts in the report.
 
 ## Implementation Plan
 
-**Step 1: Update frontend to send local timezone UTC bounds**  
-Modify the `fetchPayouts` function to calculate the exact UTC bounds for the selected local dates. Create a local Date object for `fromDate` at `00:00:00` and for `toDate` at `23:59:59.999`. Convert these to UTC ISO strings using `.toISOString()` and pass them as the `from` and `to` query parameters in the API request instead of the raw `YYYY-MM-DD` strings.
-Files: `components/reports/idre-payouts-report.tsx`
-
-**Step 2: Update API route to accept and parse ISO datetime strings**  
-Update `dateParamSchema` to accept ISO 8601 datetime strings (e.g., using `z.string().datetime()` or updating the regex). Modify the parsing logic to check if `fromParam` and `toParam` contain a time component (e.g., include 'T'). If they do, parse them directly into `Date` objects. Only append `T00:00:00.000Z` and `T23:59:59.999Z` as a fallback if the old `YYYY-MM-DD` format is received.
+**Step 1: Update IDRE Payouts API query to include same-day payouts**  
+In the `GET` function, locate the `prisma.payment.findMany` database query. The `where` clause of this query is likely filtering by a date field that is only populated after the NACHA batch process runs. Modify this condition to filter using the payment's creation or completion date field against the `from` and `to` date variables. This will ensure payouts created on the current day are included in the results before the NACHA process is complete.
 Files: `app/api/reports/idre-payouts/route.ts`
 
-**Risk Level:** LOW — The changes are isolated to the IDRE payouts report and only affect how date boundaries are calculated and parsed, ensuring current-day records in the user's local timezone are included.
+**Step 2: Align report export logic with the API change**  
+Locate the section within the `POST` function responsible for generating the IDRE Payouts report data for export. This section will contain a Prisma query similar to the one in the main report API. Apply the same logic change to its `where` clause, switching the date filter from a post-processing timestamp to the payment's creation or completion timestamp. This ensures the exported report is consistent with the on-screen data.
+Files: `app/api/reports/export/route.ts`
+
+**Risk Level:** LOW — The change is isolated to the data-fetching logic for a single report and its export functionality. It modifies a `where` clause in a read-only query and does not affect any payment processing or data mutation logic. The risk of unintended side effects is minimal.
 
 ## Proposed Code Changes
 
-### `components/reports/idre-payouts-report.tsx` (modify)
-The frontend previously sent raw `YYYY-MM-DD` strings, which the backend parsed as UTC midnight, causing payouts created later in the day in the user's local timezone to be excluded. By calculating the exact start and end of the day in the user's local timezone and converting them to UTC ISO strings, we ensure the entire selected day is covered.
-```
---- a/components/reports/idre-payouts-report.tsx
-+++ b/components/reports/idre-payouts-report.tsx
-@@ -55,7 +55,12 @@
-     setLoading(true);
-     setError(null);
-     try {
--      const response = await fetch(`/api/reports/idre-payouts?from=${fromDate}&to=${toDate}`);
-+      // Calculate exact UTC bounds for the selected local dates
-+      const fromDateObj = new Date(`${fromDate}T00:00:00`);
-+      const toDateObj = new Date(`${toDate}T23:59:59.999`);
-+      const fromIso = fromDateObj.toISOString();
-+      const toIso = toDateObj.toISOString();
-+
-+      const response = await fetch(`/api/reports/idre-payouts?from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`);
-       const result: IdrePayoutsResponse = await response.json();
-```
-
 ### `app/api/reports/idre-payouts/route.ts` (modify)
-The API route needs to accept the new ISO datetime strings sent by the frontend. We update the Zod schema to allow an optional time component (`T.*`). When parsing the dates, we check if a time component is present; if so, we use the provided exact UTC time. If not (e.g., when defaulting to today's date in `YYYY-MM-DD` format), we fall back to appending the start and end of the day in UTC.
+The original query filtered payments based on `nachaFile.processedAt`, which meant that payouts only appeared in the report after the NACHA file generation process was complete. This change modifies the query to filter by the payment's `createdAt` field, ensuring that payouts created on the current day are included in the report immediately. The `orderBy` clause has also been updated to sort by `createdAt` for consistency.
 ```typescript
 --- a/app/api/reports/idre-payouts/route.ts
 +++ b/app/api/reports/idre-payouts/route.ts
-@@ -9,7 +9,7 @@
- import { CaseStatus } from "@prisma/client";
- import { z } from "zod";
- 
--const dateParamSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid date format. Expected YYYY-MM-DD.");
-+const dateParamSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}(T.*)?$/, "Invalid date format. Expected YYYY-MM-DD or ISO datetime.");
- 
- export async function GET(request: NextRequest) {
- 
-@@ -29,13 +29,17 @@
-     const toParsed = dateParamSchema.safeParse(toParam);
-     if (!fromParsed.success || !toParsed.success) {
-       return NextResponse.json(
--        { error: "Invalid date format. Expected YYYY-MM-DD." },
-+        { error: "Invalid date format. Expected YYYY-MM-DD or ISO datetime." },
-         { status: 400 }
-       );
-     }
- 
-     // Parse dates as full UTC day range to ensure current-day payouts are included
--    const from = new Date(`${fromParsed.data}T00:00:00.000Z`);
--    const to = new Date(`${toParsed.data}T23:59:59.999Z`);
-+    const from = fromParsed.data.includes("T")
-+      ? new Date(fromParsed.data)
-+      : new Date(`${fromParsed.data}T00:00:00.000Z`);
-+    const to = toParsed.data.includes("T")
-+      ? new Date(toParsed.data)
-+      : new Date(`${toParsed.data}T23:59:59.999Z`);
- 
-     if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+@@ -58,15 +58,9 @@
+         direction: 'OUT',
+         type: 'IDRE_PAYOUT',
+         status: 'COMPLETED',
+-        nachaFileId: {
+-          not: null,
+-        },
+-        nachaFile: {
+-          processedAt: {
+-            gte: from,
+-            lte: to,
+-          },
++        createdAt: {
++          gte: from,
++          lte: to,
+         },
+       },
+       include: {
+@@ -85,9 +79,7 @@
+         },
+       },
+       orderBy: {
+-        nachaFile: {
+-          processedAt: 'desc',
+-        },
++        createdAt: 'desc',
+       },
+     });
 ```
+
+### `app/api/reports/export/route.ts` (modify)
+This change aligns the report export functionality with the on-screen report API. The Prisma query for fetching IDRE Payouts data for export is updated to filter by `createdAt` instead of `nachaFile.processedAt`. This ensures that the exported CSV file is consistent with the UI and includes same-day payouts that have not yet undergone NACHA processing.
+```typescript
+--- a/app/api/reports/export/route.ts
++++ b/app/api/reports/export/route.ts
+@@ -123,18 +123,12 @@
+           direction: 'OUT',
+           type: 'IDRE_PAYOUT',
+           status: 'COMPLETED',
+-          nachaFileId: {
+-            not: null,
+-          },
+-          nachaFile: {
+-            processedAt: {
+-              gte: fromDate,
+-              lte: toDate,
+-            },
++          createdAt: {
++            gte: fromDate,
++            lte: toDate,
+           },
+         },
+         include: {
+@@ -156,9 +150,7 @@
+           },
+         },
+         orderBy: {
+-          nachaFile: {
+-            processedAt: 'desc',
+-          },
++          createdAt: 'desc',
+         },
+       });
+```
+
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
-Framework: `Jest / React Testing Library`
+Framework: `Vitest`
 
-- **should fetch report with exact UTC bounds for local timezone** — Verifies that the frontend calculates and sends exact UTC bounds based on the user's local timezone, fixing the bug where current day payouts were missed.
-- **should parse ISO strings with time components correctly** — Verifies that the API route correctly parses the new ISO string format sent by the frontend without overriding the time to UTC midnight.
-- **should fallback to UTC midnight when time component is missing** *(edge case)* — Ensures backward compatibility or fallback behavior works correctly when the time component is omitted.
+- **shouldIncludePayoutsCreatedTodayWithoutNachaProcessing** *(edge case)* — This is a regression test to confirm the bug fix. It verifies that the IDRE payouts report API now includes payouts created on the current day, even if they have not yet been processed for NACHA generation.
+- **shouldExportPayoutsCreatedTodayWithoutNachaProcessing** *(edge case)* — This test verifies that the fix was also applied to the report export functionality. It ensures that the exported CSV for IDRE Payouts includes same-day payouts that have not yet been processed for NACHA.
+
+## Confluence Documentation References
+
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page describes the end-to-end case lifecycle, including the "Payment / Accounting" actor. The ticket describes a timing issue with payout reporting, which is directly related to the business process flow defined in this document. Understanding this workflow is necessary to determine when payout data should be considered final and ready for reporting.
+
+**Suggested Documentation Updates:**
+
+- IDRE Worflow
 
 ## AI Confidence Scores
-Plan: 95%, Code: 95%, Tests: 95%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

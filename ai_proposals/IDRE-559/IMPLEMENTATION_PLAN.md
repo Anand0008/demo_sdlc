@@ -3,161 +3,124 @@
 **Jira Ticket:** [IDRE-559](https://orchidsoftware.atlassian.net//browse/IDRE-559)
 
 ## Summary
-Fix the inability to pay for disputes when a specific organization is selected by ensuring newly added bank accounts are correctly linked to the organization. This involves passing the organization ID from the payment form to the Stripe intent metadata, and updating the Stripe webhook to save the organization ID when creating the bank account record.
+This plan addresses a UI rendering error on the payments page that occurs when submitting an ACH payment with a large number of cases. The fix involves modifying the `processBulkPayment` server action in `lib/party-actions.ts` to return a minimal success message instead of a large data payload. The client component, `app/app/payments/components/payment-form.tsx`, will be updated to handle this new response by showing a success toast and then triggering a server-side data refresh, which resolves the rendering issue.
 
 ## Implementation Plan
 
-**Step 1: Pass Organization ID from Payment Form**  
-Update the `PaymentForm` component to explicitly pass the `activeOrganizationId` (or the derived organization ID from the selected cases) to the `processBulkPayment` server action when submitting the form or adding new bank details.
+**Step 1: Modify `processBulkPayment` Server Action to Return Minimal Response**  
+Locate the `processBulkPayment` server action. Modify the function's return statement to prevent it from sending a large payload (like the full list of updated cases) back to the client. Instead, upon successful processing, it should return a minimal, serializable object containing only a success flag and perhaps a batch identifier. For example: `return { success: true, data: { message: "Payment processing started." } };`
+Files: `lib/party-actions.ts`
+
+**Step 2: Update Payment Form to Handle New Action Response and Refresh**  
+In the form submission handler that calls `processBulkPayment`, update the logic that processes the returned result. Instead of expecting a large data object to update the component's state, the logic should now handle the new minimal success object. On success, display a toast notification to the user and then call `router.refresh()` to reload the page's data from the server. This ensures the UI reflects the new payment status without causing a rendering error from a large data payload. The `useRouter` hook is already imported in this component.
 Files: `app/app/payments/components/payment-form.tsx`
 
-**Step 2: Include Organization ID in Stripe Intent Metadata**  
-Modify the `processBulkPayment` action (and any related Stripe intent creation functions) to accept the `organizationId` parameter. Inject this `organizationId` into the `metadata` object when creating the Stripe PaymentIntent or SetupIntent.
-Files: `lib/actions/party-payments.ts`
-
-**Step 3: Link Bank Account to Organization in Webhook**  
-Update the Stripe webhook event handlers (e.g., `payment_intent.succeeded`, `setup_intent.succeeded`) to extract the `organizationId` from the intent's `metadata`. When creating or updating the `BankAccount` record in the database, explicitly set the `organizationId` field to prevent 'unknown ownership' records.
-Files: `app/api/stripe/webhook/route.ts`
-
-**Step 4: Enforce Organization-Specific Banking Checks**  
-Review and update `checkBankingSetup` and `getPartyDashboardBankAccounts` to ensure they correctly validate the presence of bank accounts using the specific `organizationId`. Add robust fallback or logging if an 'unknown ownership' account is detected to aid in ongoing investigations.
-Files: `lib/actions/party-dashboard.ts`
-
-**Risk Level:** MEDIUM — Modifying payment intent metadata and webhook handlers carries a moderate risk, as errors could disrupt the payment flow or bank account creation process. However, the changes are targeted and directly address the 'unknown ownership' data integrity issue.
-
-**Deployment Notes:**
-- Ensure Stripe webhook endpoint is properly configured and receiving metadata in staging/production environments.
-- Monitor logs for any remaining 'unknown ownership' bank account creations after deployment.
+**Risk Level:** LOW — The issue is confined to the staging environment and a specific user flow. The proposed change is minimal, targeting only the data transfer between a server action and a client component, and uses a standard pattern (action followed by router refresh) to resolve the issue, which has a low risk of side effects.
 
 ## Proposed Code Changes
 
+### `lib/party-actions.ts` (modify)
+The `processBulkPayment` server action was re-fetching all cases and returning them to the client. This large data payload was causing the client-side component to crash. This change removes the unnecessary data fetching and returns a simple success message, which is much smaller and avoids the rendering issue. The client will be responsible for refreshing its data.
+```typescript
+--- a/lib/party-actions.ts
++++ b/lib/party-actions.ts
+@@ -249,30 +249,12 @@
+     // The client will handle UI updates via router.refresh().
+   }
+ 
+-  // Re-fetch cases to update the UI
+-  const { data: partyUser } = await getPartyUserFromSession();
+-  if (!partyUser) {
+-    return { success: false, error: "User not found." };
+-  }
+-
+-  const updatedCasesResult = await getCasesForPayment({
+-    partyUserId: partyUser.id,
+-    organizationId: activeOrganizationId,
+-    page: 1,
+-    pageSize: 20, // Default page size
+-    partyType: partyType || undefined,
+-  });
+-
+-  if (!updatedCasesResult.success) {
+-    return {
+-      success: false,
+-      error: "Could not retrieve updated cases after payment.",
+-    };
+-  }
+-
+   return {
+     success: true,
+-    data: {
+-      cases: updatedCasesResult.data.cases,
+-      totalCases: updatedCasesResult.data.totalCases,
+-      totalPages: updatedCasesResult.data.totalPages,
+-    },
++    data: {
++      message:
++        "Payment processing has been initiated. The list will update shortly.",
++    },
+   };
+ }
+```
+
 ### `app/app/payments/components/payment-form.tsx` (modify)
-Explicitly pass the `organizationId` (either from props or derived from the selected cases) to the server actions that create Stripe intents, ensuring the resulting bank account is linked to the correct organization.
+This change updates the form submission handler to correctly process the new, minimal response from the `processBulkPayment` action. Instead of attempting to update local state with a large data payload (which is no longer sent), it now displays a success toast and calls `router.refresh()`. This triggers a fresh data fetch from the server, updating the UI safely and efficiently without causing the rendering crash.
 ```
 --- a/app/app/payments/components/payment-form.tsx
 +++ b/app/app/payments/components/payment-form.tsx
-@@ -...@@
- interface PaymentFormProps {
-   cases: Case[];
-   bankAccounts: BankAccount[];
-+  activeOrganizationId?: string | null;
- }
+@@ -581,18 +581,17 @@
+     setIsSubmitting(false);
  
-@@ -...@@
-   const handlePayment = async () => {
-     try {
-+      // Derive organization ID from selected cases if not explicitly provided
-+      const selectedCaseObjects = cases.filter(c => selectedCases.includes(c.id));
-+      const derivedOrganizationId = activeOrganizationId || (selectedCaseObjects.length > 0 ? selectedCaseObjects[0].organizationId : null);
+     if (result.success) {
+-      toast.success("Payment successful!");
+-      // Update local state with the new data from the server action
+-      setCases(result.data.cases);
+-      setTotalCases(result.data.totalCases);
+-      setPagination(prev => ({
+-        ...prev,
+-        totalPages: result.data.totalPages,
+-        currentPage: 1,
+-      }));
++      toast.success(
++        result.data.message ||
++          "Payment processing initiated. The page will now refresh."
++      );
 +
-       const result = await processBulkPayment({
-         caseIds: selectedCases,
-         paymentMethodId: selectedPaymentMethod,
-+        organizationId: derivedOrganizationId,
-       });
-@@ -...@@
-   const handleAddBankAccount = async () => {
-     try {
-+      // Derive organization ID from selected cases if not explicitly provided
-+      const selectedCaseObjects = cases.filter(c => selectedCases.includes(c.id));
-+      const derivedOrganizationId = activeOrganizationId || (selectedCaseObjects.length > 0 ? selectedCaseObjects[0].organizationId : null);
++      // Instead of updating local state with a large payload,
++      // trigger a server-side refresh of the page data.
++      // This avoids the component rendering error from the large response.
++      router.refresh();
 +
--      const result = await createSetupIntent();
-+      const result = await createSetupIntent({ organizationId: derivedOrganizationId });
+       // Reset form state after submission
+       form.reset({ ...values, selectedCases: [] });
+       setSelectedRows({});
+       setSelectAll(false);
 ```
 
-### `lib/actions/party-payments.ts` (modify)
-Accept the `organizationId` parameter in payment and setup intent creation functions, and inject it into the Stripe intent `metadata` so it can be retrieved by the webhook.
-```typescript
---- a/lib/actions/party-payments.ts
-+++ b/lib/actions/party-payments.ts
-@@ -...@@
- export async function processBulkPayment(params: {
-   caseIds: string[];
-   paymentMethodId?: string;
-+  organizationId?: string | null;
- }) {
-@@ -...@@
-   const paymentIntent = await stripe.paymentIntents.create({
-     amount,
-     currency: "usd",
-     customer: customerId,
-     payment_method: paymentMethodId,
-     metadata: {
-       userId: user.id,
-       caseIds: params.caseIds.join(","),
-+      organizationId: params.organizationId || "",
-     },
-   });
-@@ -...@@
--export async function createSetupIntent() {
-+export async function createSetupIntent(params?: { organizationId?: string | null }) {
-@@ -...@@
-   const setupIntent = await stripe.setupIntents.create({
-     customer: customerId,
-     payment_method_types: ["us_bank_account"],
-     metadata: {
-       userId: user.id,
-+      organizationId: params?.organizationId || "",
-     },
-   });
-```
-
-### `app/api/stripe/webhook/route.ts` (modify)
-Extract the `organizationId` from the Stripe intent metadata and explicitly set it when creating or updating the `BankAccount` record in the database to prevent "unknown ownership" records.
-```typescript
---- a/app/api/stripe/webhook/route.ts
-+++ b/app/api/stripe/webhook/route.ts
-@@ -...@@
-     if (event.type === "setup_intent.succeeded" || event.type === "payment_intent.succeeded") {
-       const intent = event.data.object as Stripe.SetupIntent | Stripe.PaymentIntent;
-       const metadata = intent.metadata || {};
-+      const organizationId = metadata.organizationId || null;
- 
-       // ... existing code to extract payment method details ...
- 
-       await prisma.bankAccount.upsert({
-         where: { stripePaymentMethodId: paymentMethodId },
-         create: {
-           userId: metadata.userId,
-+          organizationId: organizationId,
-           // ... other fields
-         },
-         update: {
-+          organizationId: organizationId,
-           // ... other fields
-         }
-       });
-```
-
-### `lib/actions/party-dashboard.ts` (modify)
-No rationale provided
-```typescript
-where: {
-userId: session.user.id,
-```
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
-Framework: `Vitest / React Testing Library`
+Framework: `Vitest`
 
-- **should include organizationId in Stripe intent metadata** — Verifies that the server action correctly attaches the organizationId to the Stripe intent metadata so it can be retrieved later by the webhook.
-- **should save organizationId to BankAccount when processing Stripe webhook** — Ensures the webhook correctly extracts the organizationId from the Stripe intent metadata and links the newly created bank account to the correct organization, fixing the bug where bank accounts had unknown ownership.
-- **should pass organizationId to intent creation action on submit** — Verifies that the frontend correctly passes the organizationId down to the server action when a user attempts to add bank details or pay for a dispute.
+- **shouldShowSuccessToastAndRefreshOnSuccessfulPayment** — Verifies the new success flow where the component handles a minimal success response, shows a toast, and triggers a client-side refresh instead of processing a large data payload.
+- **shouldShowErrorToastWhenPaymentFails** *(edge case)* — Ensures that if the server action fails, the user is shown an error message and the page does not attempt to refresh, allowing the user to try again.
+- **shouldDisableSubmitButtonWhileProcessingPayment** — Verifies the UI provides feedback to the user and prevents duplicate submissions while the payment is being processed.
 
 ## Confluence Documentation References
 
-- [Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/296910852) — Contains QA testing requirements for organization selection, which is a key step in reproducing the bug.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — Highlights payments, refunds, and banking details as known complexity hotspots and thematic bug areas, directly relating to the inability to pay after adding bank details.
-- [Sprint 10](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/311820299) — Mentions an ongoing investigation into bank accounts with unknown ownership related to organizations, which may be the root cause of the payment failure.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — The ticket describes a bug that occurs when a user selects a specific organization to add bank details for payment. This PRD outlines the business rules and expected functionality for the Organization Management System, providing essential context for how this feature should work.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document identifies that the payments, refunds, and banking modules are known "complexity hotspots" and a common source of bugs. This is critical operational context for a developer fixing a payment-related issue, as it highlights the need for careful implementation and thorough regression testing.
 
 **Suggested Documentation Updates:**
 
-- Bugs
-- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This document should be reviewed after the fix is implemented to ensure it accurately reflects any changes to the component's behavior, especially if new constraints or handling for large data responses are introduced.
+- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: This document should be updated to include a specific test case for payment flows involving organizations with a large number of associated entities to prevent future performance regressions.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 95%, Tests: 95%
+Plan: 90%, Code: 90%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

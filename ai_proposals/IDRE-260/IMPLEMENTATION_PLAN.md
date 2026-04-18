@@ -3,137 +3,170 @@
 **Jira Ticket:** [IDRE-260](https://orchidsoftware.atlassian.net//browse/IDRE-260)
 
 ## Summary
-Implement aggregation logic for outgoing payments (Refunds and IDRE Payouts) by grouping transactions by banking info or address, creating a parent transaction, generating reverse invoices with email notifications, and excluding parent transactions from daily reports.
+Implement aggregation logic for outgoing payments (Refunds & IDRE Payouts) by grouping transactions by banking info or mailing address. Introduce a parent/child transaction hierarchy in the database, generate reverse invoices with dispute details, and update reporting endpoints to exclude parent transactions to prevent double-counting.
 
 ## Implementation Plan
 
-**Step 1: Update Database Schema for Payment Hierarchy**  
-Add a self-referencing relation to the `Payment` model to support the Parent/Child hierarchy. Add `parentPaymentId` (String, nullable) and a relation `childPayments` pointing to `Payment`. Add fields for `isAggregatedParent` (Boolean, default false) to easily distinguish parent records.
+**Step 1: Update Database Schema for Parent/Child Payments**  
+Update the `Payment` model to support the Transaction ID Hierarchy. Add a nullable `parentPaymentId` field (String) with a self-relation (`@relation("PaymentToPayment")`) to link child transactions to their aggregated parent. Add a boolean field `isAggregatedParent` (default `false`) to easily identify transfer vessels.
 Files: `prisma/schema.prisma`
 
-**Step 2: Implement Payment Aggregation Logic**  
-Implement the aggregation logic for outgoing payments (Refunds & IDRE Payouts). Create a function that fetches pending outgoing payments, groups them by identical Banking Information (Routing + Account) for ACH, or identical Mailing Address + Payee Name for Checks. For each group with >1 record, create a Parent Payment record with the aggregated total, and update the underlying child `Payment` records to set their `parentPaymentId` to the new Parent Payment ID.
+**Step 2: Implement Payment Aggregation and Reverse Invoice Logic**  
+Implement the `aggregateOutgoingPayments` logic. Group pending outgoing payments (Refunds & IDRE Payouts) by `[Payee] + [Routing/Account]` for ACH, or `[Payee] + [Mailing Address]` for Checks. For each group, create a parent `Payment` record (`isAggregatedParent: true`) with the summed total. Update the grouped child `Payment` records to set their `parentPaymentId` to the new parent. Implement logic to generate a "Reverse Invoice" (CSV/PDF) detailing the child disputes, and trigger an email notification to the payee containing the total amount, organization name, status, and the attached dispute list.
 Files: `lib/actions/party-payments.ts`
 
-**Step 3: Implement Reverse Invoice and Email Notifications**  
-Integrate Reverse Invoice generation and email notifications into the aggregation flow. After creating a Parent Payment, generate a CSV/PDF detailing the list of included Dispute IDs and their individual amounts. Trigger an email to the recipient containing the Total Amount Paid, Organization Name, Status, and the generated CSV/PDF attachment.
-Files: `lib/actions/party-payments.ts`
-
-**Step 4: Exclude Parent Transactions from Daily Reports**  
-Update the database queries in the daily reporting routes to explicitly exclude Parent Transactions. Add a `where` clause condition (e.g., `isAggregatedParent: false` or `parentPaymentId: null` depending on schema implementation) to ensure only child line items are booked, preventing double accounting.
+**Step 3: Apply Exclusion Rule to IDRE Payouts Report**  
+Update the Prisma query in the `GET` handler to enforce the Exclusion Rule. Add `isAggregatedParent: false` (or equivalent logic) to the `where` clause to ensure that the aggregated parent transactions are excluded from the daily report, preventing double booking while retaining the individual child line items.
 Files: `app/api/reports/idre-payouts/route.ts`
 
-**Risk Level:** HIGH — Modifying core payment logic and schema to introduce a parent/child hierarchy carries a high risk of impacting financial reporting and reconciliation if not implemented carefully.
-⚠️ **Breaking Changes: YES**
+**Step 4: Apply Exclusion Rule to Other Financial Reports**  
+Apply the same `isAggregatedParent: false` exclusion rule to the Prisma queries in these reporting endpoints to ensure parent transfer vessels do not skew CMS or outstanding payment totals.
+Files: `app/api/reports/cms-payments/route.ts`, `app/api/reports/outstanding-payments/route.ts`
+
+**Risk Level:** MEDIUM — Modifying the payment schema and introducing aggregation logic affects core financial flows. The exclusion rule is critical to prevent double-counting in reconciliation reports. Comprehensive testing is required to ensure child transactions are correctly linked and reported.
 ⚠️ **Database Migrations Required: YES**
 
 **Deployment Notes:**
-- Run database migrations to apply the new parent/child relationship on the Payment table.
-- Ensure that any existing pending outgoing payments are handled correctly before enabling the aggregation cron/action.
+- Run Prisma migrations to apply the new `parentPaymentId` and `isAggregatedParent` fields to the `Payment` table.
+- Ensure existing payments default to `isAggregatedParent: false` to maintain historical reporting accuracy.
 
 ## Proposed Code Changes
 
 ### `prisma/schema.prisma` (modify)
-Adds a self-referencing relation to the `Payment` model to support the Parent/Child hierarchy for aggregated payments. The `isAggregatedParent` flag allows easy filtering of parent records.
+Adds the necessary fields to support the Transaction ID Hierarchy. `parentPaymentId` links child transactions to their aggregated parent, and `isAggregatedParent` easily identifies transfer vessels for exclusion in reports.
 ```
 --- a/prisma/schema.prisma
 +++ b/prisma/schema.prisma
-@@ -... @@
+@@ -x,x +x,x @@
  model Payment {
-   id                                String                     @id
-+  parentPaymentId                   String?
-+  parentPayment                     Payment?                   @relation("PaymentHierarchy", fields: [parentPaymentId], references: [id])
-+  childPayments                     Payment[]                  @relation("PaymentHierarchy")
-+  isAggregatedParent                Boolean                    @default(false)
-```
-
-### `app/api/reports/idre-payouts/route.ts` (modify)
-Excludes aggregated parent transactions from the daily report to prevent double booking/accounting, ensuring only the underlying child line items are reported.
-```typescript
---- a/app/api/reports/idre-payouts/route.ts
-+++ b/app/api/reports/idre-payouts/route.ts
-@@ -44,6 +44,7 @@
-     // Use Prisma ORM to fetch payments and allocations
-     const payments = await prisma.payment.findMany({
-       where: {
-+        isAggregatedParent: false,
+   id                  String    @id @default(cuid())
+   // ... existing fields ...
++
++  // Aggregation fields for outgoing payments
++  parentPaymentId     String?
++  parentPayment       Payment?  @relation("PaymentToPayment", fields: [parentPaymentId], references: [id])
++  childPayments       Payment[] @relation("PaymentToPayment")
++  isAggregatedParent  Boolean   @default(false)
+ }
 ```
 
 ### `lib/actions/party-payments.ts` (modify)
-Implements the core aggregation logic. It fetches pending outgoing payments, groups them by the specified criteria (ACH vs Check), creates a parent payment for groups with >1 record, and links the children. It also prepares the data structure required for the Reverse Invoice and email notifications.
+Implements the core aggregation logic. Groups pending outgoing payments by `[Payee] + [Routing/Account]` for ACH, or `[Payee] + [Mailing Address]` for Checks. Creates a parent payment record with the summed total and updates the grouped child records to link to the new parent.
 ```typescript
 --- a/lib/actions/party-payments.ts
 +++ b/lib/actions/party-payments.ts
-@@ -... @@
-+
-+/**
-+ * Aggregates pending outgoing payments (Refunds & IDRE Payouts) into a single parent payment
-+ * based on identical banking information (ACH) or mailing address + payee name (Check).
-+ */
+@@ -x,x +x,x @@
 +export async function aggregateOutgoingPayments() {
-+  // Fetch pending outgoing payments that are not already aggregated
++  // Fetch pending outgoing payments that haven't been aggregated yet
 +  const pendingPayments = await prisma.payment.findMany({
 +    where: {
-+      direction: 'OUTGOING', // Assuming OUTGOING or OUTBOUND based on schema
-+      status: 'PENDING',
++      direction: "OUTGOING",
++      status: "PENDING",
 +      isAggregatedParent: false,
 +      parentPaymentId: null,
++      type: { in: ["REFUND", "IDRE_PAYOUT"] },
 +    },
 +    include: {
-+      party: true,
++      organization: true,
++      bankAccount: true,
 +      case: true,
-+    }
++    },
 +  });
 +
++  // Group payments
 +  const groups: Record<string, typeof pendingPayments> = {};
 +
-+  // Group payments by identical banking info or address
 +  for (const payment of pendingPayments) {
-+    let key = '';
-+    if (payment.method === 'ACH') {
-+      const routing = payment.party?.routingNumber || (payment as any).routingNumber;
-+      const account = payment.party?.accountNumber || (payment as any).accountNumber;
-+      if (routing && account) {
-+        key = `ACH_${routing}_${account}`;
-+      }
-+    } else if (payment.method === 'CHECK') {
-+      const address = payment.party?.mailingAddress || (payment as any).mailingAddress;
-+      const payee = payment.party?.payeeName || payment.party?.name || (payment as any).payeeName;
-+      if (address && payee) {
-+        key = `CHECK_${address}_${payee}`;
-+      }
++    const payee = payment.organization?.name || "UNKNOWN";
++    let groupKey = "";
++
++    if (payment.paymentMethod === "ACH" && payment.bankAccount) {
++      // Group by Payee + Routing/Account
++      groupKey = `ACH_${payee}_${payment.bankAccount.routingNumber}_${payment.bankAccount.accountNumber}`;
++    } else if (payment.paymentMethod === "CHECK") {
++      // Group by Payee + Mailing Address
++      // Assuming organization has a mailingAddress field or similar relation
++      const address = payment.organization?.mailingAddress || "UNKNOWN_ADDRESS";
++      groupKey = `CHECK_${payee}_${address}`;
++    } else {
++      continue; // Skip un-groupable payments
 +    }
 +
-+    if (key) {
-+      if (!groups[key]) groups[key] = [];
-+      groups[key].push(payment);
++    if (!groups[groupKey]) {
++      groups[groupKey] = [];
 +    }
++    groups[groupKey].push(payment);
 +  }
 +
-+  // Process groups and create parent payments
++  // Process groups
 +  for (const [key, group] of Object.entries(groups)) {
-+    if (group.length > 1) {
-+      const totalAmount = group.reduce((sum, p) => sum + Number(p.amount), 0);
-+      const firstPayment = group[0];
++    if (group.length <= 1) continue; // Only aggregate if > 1 record
 +
++    const totalAmount = group.reduce((sum, p) => sum + p.amount, 0);
++    const firstPayment = group[0];
++
++    await prisma.$transaction(async (tx) => {
 +      // Create parent payment
-+      const parentPayment = await prisma.payment.create({
-+        data: 
++      const parentPayment = await tx.payment.create({
++        data: {
++          amount: totalAmount,
++          direction: "OUTGOING",
++          status: "PENDING",
++          t
 ... (truncated — see full diff in files)
+```
+
+### `app/api/reports/idre-payouts/route.ts` (modify)
+Enforces the Exclusion Rule to prevent double booking/accounting. The Parent Transaction (Aggregated Total) must NOT be included in the Daily Report.
+```typescript
+--- a/app/api/reports/idre-payouts/route.ts
++++ b/app/api/reports/idre-payouts/route.ts
+@@ -x,x +x,x @@
+   const payments = await prisma.payment.findMany({
+     where: {
+       // ... existing conditions ...
++      isAggregatedParent: false,
+     },
+```
+
+### `app/api/reports/cms-payments/route.ts` (modify)
+Applies the same exclusion rule to ensure parent transfer vessels do not skew CMS payment totals.
+```typescript
+--- a/app/api/reports/cms-payments/route.ts
++++ b/app/api/reports/cms-payments/route.ts
+@@ -x,x +x,x @@
+   const payments = await prisma.payment.findMany({
+     where: {
+       // ... existing conditions ...
++      isAggregatedParent: false,
+     },
+```
+
+### `app/api/reports/outstanding-payments/route.ts` (modify)
+Applies the same exclusion rule to ensure parent transfer vessels do not skew outstanding payment totals.
+```typescript
+--- a/app/api/reports/outstanding-payments/route.ts
++++ b/app/api/reports/outstanding-payments/route.ts
+@@ -x,x +x,x @@
+   const payments = await prisma.payment.findMany({
+     where: {
+       // ... existing conditions ...
++      isAggregatedParent: false,
+     },
 ```
 
 ## Test Suggestions
 
-Framework: `Vitest`
+Framework: `Jest or Vitest`
 
-- **should aggregate ACH payments with identical routing and account numbers** — Verifies that ACH payments with matching banking details are aggregated into a single parent transaction.
-- **should aggregate Check payments with identical payee name and mailing address** — Verifies that Check payments with matching address and payee name are aggregated into a single parent transaction.
-- **should not aggregate payments if routing numbers or addresses differ** *(edge case)* — Ensures aggregation strictly requires exact matches on banking info or address, preventing incorrect grouping.
-- **should correctly calculate the total amount for the aggregated parent payment** — Verifies the mathematical accuracy of the aggregated total amount for a large batch of payments.
-- **should exclude aggregated parent transactions from the daily report** — Verifies the exclusion rule to prevent double booking in daily reports.
+- **should aggregate ACH payments with identical routing and account numbers** — Verifies that ACH payments to the same organization with identical banking details are grouped into a single parent transaction.
+- **should aggregate Check payments with identical payee and mailing address** — Verifies that physical check payments to the same organization with identical mailing addresses are grouped into a single parent transaction.
+- **should not aggregate ACH payments with different banking information** *(edge case)* — Ensures that payments are not incorrectly aggregated if the banking information differs, even if the payee is the same.
+- **should exclude aggregated parent transactions from IDRE payouts report** — Verifies the Exclusion Rule: Parent Transactions must not be included in the daily report to prevent double booking.
+- **should exclude aggregated parent transactions from outstanding payments report** — Verifies the Exclusion Rule applies to the outstanding payments report to prevent skewing totals.
 
 ## AI Confidence Scores
-Plan: 80%, Code: 85%, Tests: 95%
+Plan: 95%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

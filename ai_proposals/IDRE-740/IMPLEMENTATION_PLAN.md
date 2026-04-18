@@ -3,53 +3,64 @@
 **Jira Ticket:** [IDRE-740](https://orchidsoftware.atlassian.net//browse/IDRE-740)
 
 ## Summary
-Fix the pending payments queries to strictly exclude 'HELD' items, ensuring only genuinely pending payments are displayed on the dashboard.
+This plan resolves an issue on the Pending Payments dashboard where 'held' payments were incorrectly displayed alongside 'pending' ones. The fix involves modifying the `getPendingPayments` server action in `lib/actions/payment.ts` to adjust the database query, ensuring it exclusively fetches payments with the 'PENDING' status. The plan also includes a verification step to confirm that users can still view 'held' payments using the existing UI filter toggles.
 
 ## Implementation Plan
 
-**Step 1: Fix pending payments filter to exclude held items**  
-Modify the database queries fetching pending payments (e.g., `getPendingInvoices` and `getPaymentQueueStats`) to strictly filter by `status: 'PENDING'` and explicitly exclude `status: 'HELD'`. This ensures held items are not mixed into the Pending Payments dashboard view.
-Files: `lib/actions/party-payments.ts`
+**Step 1: Adjust Database Query in `getPendingPayments` Action**  
+In the `getPendingPayments` function, locate the Prisma query responsible for fetching payments. Modify the `where` clause to strictly filter for payments with a `PENDING` status, excluding the `ON_HOLD` status that is currently being incorrectly included.
+Files: `lib/actions/payment.ts`
 
-**Step 2: Exclude held items from outstanding payments report**  
-Update the Prisma query fetching outstanding payments to ensure that the `where` clauses explicitly exclude the 'HELD' status, aligning the report data with the corrected dashboard behavior.
-Files: `app/api/reports/outstanding-payments/route.ts`
+**Step 2: Verify Explicit Filtering for 'Held' Payments**  
+Review the `getPaymentsByStatus` function to ensure it correctly filters payments based on the status parameter passed from the UI. This will confirm that users can still explicitly filter to see 'held' payments, satisfying the ticket's requirement that held items remain accessible via a filter toggle. This is a verification step, and no code changes are anticipated.
+Files: `lib/actions/payment.ts`
 
-**Risk Level:** LOW — The changes are isolated to query filters and do not alter the underlying data structure or payment processing logic.
+**Step 3: Confirm UI Correctness on Payments Dashboard**  
+No code changes are required in this file. After the backend changes are implemented, manually verify that the Pending Payments dashboard correctly displays only pending items by default. Also, test the filter functionality to ensure that 'held' items can be viewed by explicitly selecting the 'held' status filter.
+Files: `app/dashboard/payments/page.tsx`
+
+**Risk Level:** LOW — The change is confined to a database query's `where` clause for a read operation on the payments dashboard. The risk is low as it doesn't alter data or core transaction logic, but care must be taken to use the correct `PaymentStatus` enum to avoid hiding genuinely pending payments.
+
+**Deployment Notes:**
+- The payments team should be informed to verify the corrected view in a staging environment before production deployment to ensure accuracy.
 
 ## Proposed Code Changes
 
-### `lib/actions/party-payments.ts` (modify)
-Modify the database queries fetching pending payments (e.g., `getPendingInvoices` and `getPaymentQueueStats`) to strictly filter by `status: 'PENDING'` and explicitly exclude `status: 'HELD'`. This ensures held items are not mixed into the Pending Payments dashboard view.
+### `lib/actions/payment.ts` (modify)
+As per the ticket, the Pending Payments view was incorrectly including 'held' items. The original Prisma query in `getPendingPayments` used an `in` clause to fetch both `PENDING` and `ON_HOLD` statuses. This change modifies the query to filter strictly for `status: PaymentStatus.PENDING`, ensuring that only pending payments are returned for the default view. Users can still view held payments by using the explicit status filter on the dashboard, which is handled by the `getPaymentsByStatus` function.
 ```typescript
-@@ -...@@
--      status: { in: ["PENDING", "HELD"] },
-+      status: "PENDING",
-@@ -...@@
--      status: { in: ["PENDING", "HELD"] },
-+      status: "PENDING",
+--- a/lib/actions/payment.ts
++++ b/lib/actions/payment.ts
+@@ -108,9 +108,7 @@
+   const where = buildBasePaymentWhereClause(filters);
+ 
+   // Default to pending payments, which also includes on hold items
+-  where.status = {
+-    in: [PaymentStatus.PENDING, PaymentStatus.ON_HOLD],
+-  };
++  where.status = PaymentStatus.PENDING;
+ 
+   const { skip, take } = calculateSkipTake(pagination);
 ```
 
-### `app/api/reports/outstanding-payments/route.ts` (modify)
-Update the Prisma query fetching outstanding payments to ensure that the `where` clauses explicitly exclude the 'HELD' status, aligning the report data with the corrected dashboard behavior.
-```typescript
-@@ -...@@
-     const cases = await prisma.case.findMany({
-       where: {
--        status: { notIn: ["CLOSED", "CANCELLED"] },
-+        status: { notIn: ["CLOSED", "CANCELLED", "HELD"] },
-```
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
 Framework: `Vitest`
 
-- **shouldStrictlyFilterByPendingStatusAndExcludeHeldItems** — Verifies that the database query for pending invoices explicitly filters out HELD items to fix the dashboard bug where 14,000 held items were shown.
-- **shouldExcludeHeldItemsFromPendingStats** — Ensures that the dashboard statistics do not count HELD items as pending.
-- **shouldFetchOutstandingPaymentsExcludingHeldStatus** — Verifies that the outstanding payments report API correctly filters out HELD items, aligning the report with the dashboard.
+- **shouldReturnOnlyPendingPaymentsWhenTheyExist** — Verifies that the function correctly retrieves and returns payments that are in the 'PENDING' state.
+- **shouldNotReturnOnHoldPayments** — This is a regression test to confirm the fix. It ensures that payments with 'ON_HOLD' status are explicitly excluded from the results, which was the source of the original bug.
+- **shouldReturnEmptyArrayWhenNoPendingPaymentsExist** *(edge case)* — Tests the scenario where there are no payments with the 'PENDING' status in the database.
+- **shouldThrowErrorWhenDatabaseQueryFails** *(edge case)* — Ensures that database errors are not swallowed and are correctly propagated up the call stack.
+
+## Confluence Documentation References
+
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This page identifies the 'payments and refunds engine' as a 'major complexity hotspot' prone to production issues. It explicitly lists 'on-hold' and 'unhold' as distinct payment statuses that are part of complex status transitions, which directly informs the developer about the business context and the need for careful regression testing when separating 'held' from 'pending' items.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 85%, Tests: 95%
+Plan: 90%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

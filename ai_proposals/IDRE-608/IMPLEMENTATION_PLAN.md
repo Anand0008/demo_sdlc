@@ -3,81 +3,58 @@
 **Jira Ticket:** [IDRE-608](https://orchidsoftware.atlassian.net//browse/IDRE-608)
 
 ## Summary
-Fix the incorrect organization name displayed in reconciliation reports by updating the API endpoints to map the organization name based on the party responsible for the payment rather than a default party.
+This plan addresses a UI bug on the Organization Reconciliation page where organization names are incorrectly displayed with a duplicate "(Main) (Main)" suffix. The fix involves a single, targeted change to the client-side rendering logic in `app/app/dashboard/reports/org-reconciliation/page.tsx` to ensure the "(Main)" suffix is only appended if it's not already present in the organization's name.
 
 ## Implementation Plan
 
-**Step 1: Fix organization name mapping in Unpaid Disputes API**  
-Update the data mapping logic in the report generation to correctly assign the organization name. Instead of defaulting to a specific party (like initiatingParty), determine the organization based on the party responsible for the payment (e.g., using the partyId associated with the payment or payment allocation).
-Files: `app/api/reports/unpaid-disputes/route.ts`
+**Step 1: Prevent duplicate "(Main)" suffix in organization dropdown**  
+In the Organization Reconciliation page component, locate the dropdown labeled "All organizations". Find the logic that maps over the list of organizations to create the dropdown options. There is likely a conditional that appends the string " (Main)" to certain organization names. Modify this logic to first check if the name already includes " (Main)" before appending it, to prevent duplication. For example, a conditional like `org.isMain && !org.name.includes("(Main)")` should be used.
+Files: `app/app/dashboard/reports/org-reconciliation/page.tsx`
 
-**Step 2: Fix organization name mapping in Outstanding Payments API**  
-Apply the same organization name mapping fix to the outstanding payments report API to ensure the correct organization is displayed for reconciliation purposes.
-Files: `app/api/reports/outstanding-payments/route.ts`
-
-**Risk Level:** LOW — The changes are isolated to report generation APIs and only affect the display of data in downloaded reports, not core payment processing or database state.
-
-**Deployment Notes:**
-- No special deployment steps required.
+**Risk Level:** LOW — The change is a minor UI text fix on a specific reporting page. It corrects a data display issue and has no impact on backend logic, data integrity, or other system functionalities. The risk of regression is minimal.
 
 ## Proposed Code Changes
 
-### `app/api/reports/unpaid-disputes/route.ts` (modify)
-The organization name in the reconciliation report should reflect the party responsible for the payment (the party associated directly with the dispute/invoice record) rather than always defaulting to the case's initiating party.
-```typescript
-@@ -20,6 +20,11 @@
-             },
-           },
-         },
-+        party: {
-+          include: {
-+            organization: true,
-+          },
-+        },
-       },
-     });
- 
-@@ -35,7 +40,7 @@
-     const formattedData = data.map((item: any) => ({
-       ...item,
--      organizationName: item.case?.initiatingParty?.organization?.name || item.initiatingParty?.organization?.name || "N/A",
-+      organizationName: item.party?.organization?.name || item.case?.initiatingParty?.organization?.name || item.initiatingParty?.organization?.name || "N/A",
-     }));
+### `app/dashboard/reports/outstanding-payments/page.tsx` (modify)
+As per the implementation plan, the current logic unconditionally appends " (Main)" to the name of a main organization. This causes a duplicate suffix if the organization's name in the database already contains "(Main)". The change adds a check (`!org.name.includes("(Main)")`) to prevent this duplication, ensuring the suffix is only added when necessary.
+```
+--- a/app/app/dashboard/reports/org-reconciliation/page.tsx
++++ b/app/app/dashboard/reports/org-reconciliation/page.tsx
+@@ -118,7 +118,9 @@
+                         {organizations.map((org) => (
+                           <SelectItem key={org.id} value={org.id}>
+                             {org.name}
+-                            {org.isMain ? " (Main)" : ""}
++                            {org.isMain && !org.name.includes("(Main)")
++                              ? " (Main)"
++                              : ""}
+                           </SelectItem>
+                         ))}
+                       </SelectContent>
 ```
 
-### `app/api/reports/outstanding-payments/route.ts` (modify)
-Ensure the outstanding payments report also correctly maps the organization name to the responsible party for accurate organization reconciliation.
-```typescript
-@@ -20,6 +20,11 @@
-             },
-           },
-         },
-+        party: {
-+          include: {
-+            organization: true,
-+          },
-+        },
-       },
-     });
- 
-@@ -35,7 +40,7 @@
-     const formattedData = data.map((item: any) => ({
-       ...item,
--      organizationName: item.case?.initiatingParty?.organization?.name || item.initiatingParty?.organization?.name || "N/A",
-+      organizationName: item.party?.organization?.name || item.case?.initiatingParty?.organization?.name || item.initiatingParty?.organization?.name || "N/A",
-     }));
-```
+**New Dependencies:**
+- `None`
 
 ## Test Suggestions
 
-Framework: `Jest / Vitest`
+Framework: `Jest`
 
-- **shouldReturnResponsiblePartyOrganizationNameForUnpaidDisputes** — Regression test to ensure the unpaid disputes report uses the responsible party's organization name.
-- **shouldMapOrganizationNameToResponsiblePartyForOutstandingPayments** — Regression test to ensure the outstanding payments report uses the responsible party's organization name.
-- **shouldHandleMissingResponsiblePartyOrganizationNameGracefully** *(edge case)* — Edge case to ensure the system does not crash if the responsible party lacks an organization name.
+- **shouldNotAppendMainSuffixIfNameAlreadyContainsIt** *(edge case)* — This is a regression test to verify the fix for the bug where a duplicate "(Main)" suffix was being added to organization names that already contained it.
+- **shouldAppendMainSuffixForMainOrgWhenNameDoesNotContainIt** — This test case ensures that the existing functionality for non-duplicate names remains unchanged. It verifies the "happy path" where the "(Main)" suffix is correctly added to a main organization's name.
+
+## Confluence Documentation References
+
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document (PRD) for the feature area in question. It is the most critical document for understanding the intended business logic, data handling, and UI display rules for organization names, which is the core of the ticket.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This release overview document describes the functionality of the Organization Management tools. It likely contains high-level descriptions and screenshots of the user interface, which can provide context on how organization names are intended to be displayed.
+
+**Suggested Documentation Updates:**
+
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This document should be updated to clarify the specific business rules for displaying organization names, especially for entities designated as "(Main)", to prevent ambiguity in implementation.
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: The screenshots and feature description in this overview should be updated post-bug-fix to reflect the correct user interface and behavior.
 
 ## AI Confidence Scores
-Plan: 60%, Code: 85%, Tests: 95%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

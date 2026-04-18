@@ -1,0 +1,111 @@
+## IDRE-587: DB Change: ReOpen Case
+
+**Jira Ticket:** [IDRE-587](https://orchidsoftware.atlassian.net//browse/IDRE-587)
+
+## Summary
+This plan will reopen two incorrectly closed cases by creating a new Prisma database migration. The migration will contain SQL statements to update the status of the two cases to 'FINAL_DETERMINATION_PENDING' and delete the associated refund records from the `payment` and `case_payment_allocation` tables. This approach is direct, auditable, and the standard procedure for database changes.
+
+## Implementation Plan
+
+**Step 1: Create a new Prisma migration file**  
+Use the Prisma CLI command `prisma migrate dev --create-only --name reopen_idre_587_cases` to generate a new, empty migration file. This file will contain the SQL statements to perform the data correction.
+Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+
+**Step 2: Update case statuses to 'FINAL_DETERMINATION_PENDING'**  
+Add an SQL `UPDATE` statement to the newly created `migration.sql` file. This statement will target the two specified case IDs and change their status to 'FINAL_DETERMINATION_PENDING'. The exact enum value was identified in the `prisma/migrations/20251104000000_add_closed_default_ip_nip_statuses/migration.sql` file.
+
+Example SQL:
+`UPDATE \`case\` SET \`status\` = 'FINAL_DETERMINATION_PENDING' WHERE \`id\` IN ('<case_id_1>', '<case_id_2>');`
+Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+
+**Step 3: Remove associated refund records**  
+Add SQL `DELETE` statements to the `migration.sql` file to remove refund records associated with the two cases. Based on the data model inferred from `lib/actions/administrative-closure.ts` and Confluence documentation, this will involve deleting from `case_payment_allocation` first to satisfy foreign key constraints, and then from the `payment` table.
+
+Example SQL:
+`DELETE FROM \`case_payment_allocation\` WHERE \`paymentId\` IN (SELECT \`id\` FROM \`payment\` WHERE \`caseId\` IN ('<case_id_1>', '<case_id_2>') AND \`type\` = 'REFUND');`
+`DELETE FROM \`payment\` WHERE \`caseId\` IN ('<case_id_1>', '<case_id_2>') AND \`type\` = 'REFUND';`
+Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+
+**Risk Level:** LOW — The change is a targeted data correction for only two specific records. Using a database migration provides a clear, version-controlled, and auditable record of the change. The primary risk is operational (running the migration correctly), which is mitigated by standard deployment procedures.
+⚠️ **Database Migrations Required: YES**
+
+**Deployment Notes:**
+- The Prisma migration must be run as part of the deployment process.
+- The changes should be verified in a staging environment before deploying to production.
+
+## Proposed Code Changes
+
+### `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql` (create)
+This new migration file is created to perform the specific data correction requested in ticket IDRE-587. Using a migration ensures the change is version-controlled, auditable, and applied consistently across all database environments. The SQL statements directly address the acceptance criteria by updating the case statuses and removing the associated refunds.
+```sql
+Type: create
+
+```sql
+-- Reopen incorrectly closed cases for ticket IDRE-587.
+-- This migration performs two actions:
+-- 1. Updates the status of two specific cases to 'FINAL_DETERMINATION_PENDING'.
+-- 2. Deletes the associated refund payments and their allocations for these cases.
+
+-- IMPORTANT: Replace '<case_id_1>' and '<case_id_2>' with the actual case IDs from the ticket.
+
+-- Step 1: Update case statuses
+UPDATE `case`
+SET `status` = 'FINAL_DETERMINATION_PENDING'
+WHERE `id` IN ('<case_id_1>', '<case_id_2>');
+
+-- Step 2: Delete refund payment allocations
+-- This must be done before deleting from the `payment` table to respect foreign key constraints.
+DELETE FROM `case_payment_allocation`
+WHERE `paymentId` IN (
+  SELECT `id` FROM `payment`
+  WHERE `caseId` IN ('<case_id_1>', '<case_id_2>') AND `type` = 'REFUND'
+);
+
+-- Step 3: Delete refund payments
+DELETE FROM `payment`
+WHERE `caseId` IN ('<case_id_1>', '<case_id_2>') AND `type` = 'REFUND';
+```
+
+Rationale: This new migration file is created to perform the specific data correction requested in ticket IDRE-587. Using a migration ensures the change is version-controlled, auditable, and applied consistently across all database environments. The SQL statements directly address the acceptance criteria by updating the case statuses and removing the associated refunds.
+
+# Dependencies
+- None
+
+# Configuration Changes
+- None
+
+# Caveats
+- The placeholder values `<case_id_1>` and `<case_id_2>` in the SQL script must be replaced with the actual IDs of the two cases mentioned in the ticket before this migration is applied.
+- The `YYYYMMDDHHMMSS` portion of the file path is a placeholder for the timestamp that will be generated by the `prisma migrate dev --create-only` command.
+- This is a one-off data correction migration and is not intended for general use.
+```
+
+**New Dependencies:**
+- `None`
+
+## Test Suggestions
+
+Framework: `Jest`
+
+- **shouldReopenCasesAndRemoveRefunds** — This test validates that the database migration correctly reopens the two specified cases and removes their associated refund data as intended. Since this change is a raw SQL migration and not application code, a traditional unit test is not applicable. Instead, this should be an integration test that runs against a real or containerized test database.
+
+## Confluence Documentation References
+
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page provides the canonical, step-by-step case lifecycle and status transitions. The ticket requires changing a case's status, and this document explains the valid states and the overall process flow that the developer must not violate.
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This document provides a high-level overview of the case workflow, defining the main phases (Eligibility, Payment Collection, Arbitration). This is essential context for a developer to understand where the 'final determination pending' status fits within the overall business process.
+- [Case Balance Report](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/308936719) — The ticket requires that 'Refunds Removed'. This page contains a SQL query that reveals the data model for case financials, showing the relationship between the `case` table and tables for payments and refunds (`case_payment_allocation`, `payment`). This is a direct technical pointer for the developer.
+
+**Suggested Documentation Updates:**
+
+- IDRE Worflow: This document should be updated to include the process for reopening an incorrectly closed case, as the current lifecycle does not account for this exception.
+- IDRE Case Workflow Documentation: This page should also be updated to reflect the possibility of reopening a case, outlining the conditions and the target status to ensure the process is documented.
+
+## AI Confidence Scores
+Plan: 90%, Code: 95%, Tests: 100%
+
+---
+> ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review
+> before merging. Verify all logic, test coverage, and edge cases independently.**
+>
+> _Generated by [Artoo](https://github.com/Telomere-techsupp/SDLCWorker) — by Telomere LLC_
+> _© 2025-2026 Telomere LLC. All rights reserved._

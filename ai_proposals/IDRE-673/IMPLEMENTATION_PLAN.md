@@ -3,193 +3,281 @@
 **Jira Ticket:** [IDRE-673](https://orchidsoftware.atlassian.net//browse/IDRE-673)
 
 ## Summary
-This plan introduces ineligible sub-statuses to provide more detail on why a dispute is ineligible. It involves updating the `CaseStatus` enum in the database, modifying the administrative closure modal to capture the specific ineligibility reason, updating the corresponding server action to save this new status, and finally, adding the new sub-statuses to the filtering options on the main cases page and its backing search API.
+This plan introduces ineligible sub-statuses by first updating the database schema and corresponding application enums. It then modifies the `AdministrativeClosureModal` to allow users to select a specific reason for ineligibility. The backend action `closeCaseAdministrative` will be updated to set these new, specific statuses. Finally, the eligibility dashboard will be enhanced to allow filtering by these new sub-statuses, providing the required tracking and reporting capabilities.
 
 ## Implementation Plan
 
-**Step 1: Update Database Schema and Create Migration**  
-In the `prisma/schema.prisma` file, extend the `CaseStatus` enum to include the new ineligible sub-statuses. The new values should be formatted like `Ineligible_Cooling_Off_Period_Not_Completed`. After updating the schema, run `npx prisma migrate dev --name add_ineligible_substatuses` to generate a new migration file that will apply these changes to the database. The list of reasons is provided in the ticket description. Example values to add: `Ineligible_Eligible_For_State_Process`, `Ineligible_Exceeded_Four_Day_Timeline`, `Ineligible_Incorrectly_Batched`, etc. for all 13 reasons.
-Files: `prisma/schema.prisma`
+**Step 1: Create Database Migration for New Ineligible Sub-statuses**  
+Create a new Prisma migration file to add the new ineligible sub-statuses to the `status` ENUM on the `case` table. The new statuses should be derived from the list in the ticket description (e.g., `INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED`, `INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE`, etc.). This will be similar to the existing migration `prisma/migrations/20251104000000_add_closed_default_ip_nip_statuses/migration.sql`.
+Files: `prisma/migrations/`
 
-**Step 2: Add Sub-Status Selector to Administrative Closure Modal**  
-Modify the `AdministrativeClosureModal` component. When a user selects a closure reason that corresponds to 'Ineligible' (e.g., `EARLY_INELIGIBLE`), conditionally render a new, required `Select` dropdown. This dropdown will be populated with the ineligible sub-statuses. The selected sub-status value must be stored in the component's state and passed to the `closeCaseAdministrative` server action upon submission.
+**Step 2: Update CaseStatus and CaseClosureReason Enums**  
+Update the `CaseStatus` enum in `lib/types/shared-enums.ts` to include all the new `INELIGIBLE_*` sub-statuses. Also, add corresponding new reasons to the `CaseClosureReason` enum to be used by the UI modal, ensuring a clear mapping between the closure reason selected in the UI and the final case status.
+Files: `lib/types/shared-enums.ts`
+
+**Step 3: Update Administrative Closure Modal with Sub-status Options**  
+In the administrative closure modal, replace the single "Ineligible" option with a comprehensive list of the new ineligible sub-statuses. Modify the `EARLY_STAGE_OPTIONS` constant (around line 22) to remove `{ value: "EARLY_INELIGIBLE", label: "Ineligible" }` and replace it with an array of options corresponding to the new `CaseClosureReason` enums added in the previous step. The labels should follow the "Ineligible – [Reason]" format from the ticket.
 Files: `components/admin/administrative-closure-modal.tsx`
 
-**Step 3: Update Server Action to Save Sub-Status**  
-Update the relevant server action, likely `closeCaseAdministrative`, within this file. Modify its signature to accept the new ineligible sub-status as an argument. In the `prisma.case.update` call within this function, set the `status` field to the new sub-status value received from the modal, instead of the generic `INELIGIBLE` status.
+**Step 4: Update Backend Action to Set New Sub-statuses**  
+Modify the `closeCaseAdministrative` server action to handle the new ineligible closure reasons. Add logic to map the new `CaseClosureReason` values to their corresponding `CaseStatus` enum values. When one of these new reasons is provided, the action should set the case status to the specific `INELIGIBLE_*` status instead of the generic `CLOSED_ADMINISTRATIVE`. Also, update the `getEntityFeePercentForReason` function (around line 63) to ensure all new ineligible reasons are treated like `EARLY_INELIGIBLE` and result in a 0% entity fee.
 Files: `lib/actions/administrative-closure.ts`
 
-**Step 4: Add New Sub-Statuses to Case Filter UI**  
-In the `CasesPageClient` component, update the status filter dropdown. Add the new ineligible sub-statuses as options in the `<Select>` component that controls the `statusFilter` state. This will allow users to filter the case list by each specific ineligibility reason.
-Files: `app/app/cases/components/cases-page-client.tsx`
+**Step 5: Implement Filtering for Ineligible Sub-statuses on Dashboard**  
+Enhance the eligibility dashboard to allow filtering by the new sub-statuses. First, update the UI in `components/eligibility/eligibility-dashboard.tsx` to include the new `INELIGIBLE_*` statuses as options in the status filter dropdown. Second, ensure the `getEligibilityCases` function in `lib/actions/eligibility.ts` can correctly process and filter cases based on these new status values when they are passed from the dashboard.
+Files: `components/eligibility/eligibility-dashboard.tsx`, `lib/actions/eligibility.ts`
 
-**Step 5: Update Case Search API to Handle New Statuses**  
-Modify the `GET` handler in the case search API. The code that builds the Prisma query currently uses `searchParams.get("status")`. Ensure that the query logic correctly handles the new `Ineligible_*` status values passed from the frontend filter. No major changes are expected if the query is already dynamically using the status parameter in the `where` clause, but this must be verified.
-Files: `app/api/cases/search/route.ts`
-
-**Risk Level:** MEDIUM — The ticket involves modifying the `CaseStatus` enum, which is a core part of the application's state machine. The Confluence documentation explicitly calls out that status transitions related to case closure are a 'complexity hotspot' and a frequent source of bugs, particularly concerning payments and refunds. While the changes are straightforward, the risk of unintended side effects in financial logic is medium.
+**Risk Level:** MEDIUM — The primary risk lies in modifying the `administrative-closure.ts` action, which handles complex financial calculations and status transitions. Incorrectly altering this logic could lead to improper fee assessments or place cases in an incorrect state. The Confluence documentation highlights this area as a "major complexity hotspot," warranting careful implementation and thorough testing.
 ⚠️ **Database Migrations Required: YES**
-
-**Deployment Notes:**
-- As per the Confluence documentation, changes to case closure statuses are a 'complexity hotspot'. Thorough regression testing is required to ensure this change does not negatively impact payment and refund logic.
-- After deployment, existing cases with the 'INELIGIBLE' status will remain as they are. There is no requirement to backfill a sub-status for them.
 
 ## Proposed Code Changes
 
 ### `prisma/schema.prisma` (modify)
-This change extends the `CaseStatus` enum in the database schema to include the new, specific sub-statuses for ineligible cases as required by the ticket. This is the foundational change that allows the system to store the new granular statuses.
+This change updates the database schema to support the new ineligible sub-statuses. It adds new values to the `CaseStatus` enum for storing the specific ineligibility reason and to the `CaseClosureReason` enum for capturing the user's selection in the UI. This is the foundational change required to track the new data.
 ```
 --- a/prisma/schema.prisma
 +++ b/prisma/schema.prisma
-@@ -100,6 +100,20 @@
-   FINAL_DETERMINATION_PENDING
+@@ -148,6 +148,19 @@
    FINAL_DETERMINATION_RENDERED
    INELIGIBLE
-+  Ineligible_Cooling_Off_Period_Not_Completed
-+  Ineligible_Eligible_For_State_Process
-+  Ineligible_Exceeded_Four_Day_Timeline
-+  Ineligible_Incorrectly_Batched
-+  Ineligible_Incorrectly_Bundled
-+  Ineligible_Item_Or_Service_Not_Covered_By_Plan
-+  Ineligible_Item_Or_Service_Not_NSA_Eligible
-+  Ineligible_Notice_Of_Initiation_Not_Submitted
-+  Ineligible_Open_Negotiation_Not_Complete
-+  Ineligible_Open_Negotiation_Not_Initiated
-+  Ineligible_Other
-+  Ineligible_Plan_Not_Subject_To_NSA
-+  Ineligible_Prior_To_Applicable_Policy_Year
    INELIGIBLE_PENDING_ADMIN_FEE
++  INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED
++  INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS
++  INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE
++  INELIGIBLE_INCORRECTLY_BATCHED
++  INELIGIBLE_INCORRECTLY_BUNDLED
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE
++  INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED
++  INELIGIBLE_OTHER
++  INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA
++  INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR
    CLOSED_DEFAULT
    CLOSED_DEFAULT_IP
+   CLOSED_DEFAULT_NIP
+@@ -164,6 +177,19 @@
+ 
+ enum CaseClosureReason {
+   EARLY_INELIGIBLE
++  INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED
++  INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS
++  INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE
++  INELIGIBLE_INCORRECTLY_BATCHED
++  INELIGIBLE_INCORRECTLY_BUNDLED
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE
++  INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED
++  INELIGIBLE_OTHER
++  INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA
++  INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR
+   EARLY_RESUBMISSION
+   EARLY_WITHDRAWAL
+   EARLY_SETTLEMENT
+```
+
+### `lib/types/shared-enums.ts` (modify)
+This change aligns the application's TypeScript enums with the updated Prisma schema. This ensures type safety and makes the new statuses and closure reasons available throughout the application.
+```typescript
+--- a/lib/types/shared-enums.ts
++++ b/lib/types/shared-enums.ts
+@@ -10,6 +10,19 @@
+   FINAL_DETERMINATION_RENDERED = "FINAL_DETERMINATION_RENDERED",
+   INELIGIBLE = "INELIGIBLE",
+   INELIGIBLE_PENDING_ADMIN_FEE = "INELIGIBLE_PENDING_ADMIN_FEE",
++  INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED = "INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED",
++  INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS = "INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS",
++  INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE = "INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE",
++  INELIGIBLE_INCORRECTLY_BATCHED = "INELIGIBLE_INCORRECTLY_BATCHED",
++  INELIGIBLE_INCORRECTLY_BUNDLED = "INELIGIBLE_INCORRECTLY_BUNDLED",
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED = "INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED",
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE = "INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE",
++  INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED = "INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED",
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE = "INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE",
++  INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED = "INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED",
++  INELIGIBLE_OTHER = "INELIGIBLE_OTHER",
++  INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA = "INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA",
++  INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR = "INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR",
+   CLOSED_DEFAULT = "CLOSED_DEFAULT",
+   CLOSED_DEFAULT_IP = "CLOSED_DEFAULT_IP",
+   CLOSED_DEFAULT_NIP = "CLOSED_DEFAULT_NIP",
+@@ -26,6 +39,19 @@
+ 
+ export enum CaseClosureReason {
+   EARLY_INELIGIBLE = "EARLY_INELIGIBLE",
++  INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED = "INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED",
++  INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS = "INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS",
++  INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE = "INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE",
++  INELIGIBLE_INCORRECTLY_BATCHED = "INELIGIBLE_INCORRECTLY_BATCHED",
++  INELIGIBLE_INCORRECTLY_BUNDLED = "INELIGIBLE_INCORRECTLY_BUNDLED",
++  INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED = "
+... (truncated — see full diff in files)
 ```
 
 ### `components/admin/administrative-closure-modal.tsx` (modify)
-This change updates the administrative closure modal to conditionally display a required dropdown for selecting an ineligibility reason when a user chooses to mark a case as "Ineligible". It introduces state to manage the selected sub-status and passes this value to the `closeCaseAdministrative` server action upon submission, ensuring the specific reason is captured.
+This change updates the administrative closure modal to display the new, specific ineligibility reasons. The generic "Ineligible" option is replaced with a detailed list, allowing users to select the precise reason for closure, which is a core requirement of the ticket.
 ```
 --- a/components/admin/administrative-closure-modal.tsx
 +++ b/components/admin/administrative-closure-modal.tsx
-@@ -13,6 +13,22 @@
- import { getAdministrativeClosurePendingDraft } from "@/lib/actions/administrative-closure-draft";
- import { getDownloadUrlAction } from "@/lib/actions/upload";
- import { AlertCircle, CheckCircle2 } from "lucide-react";
-+import { CaseStatus } from "@prisma/client";
-+
-+const INELIGIBLE_SUBSTATUS_OPTIONS = [
-+  { value: CaseStatus.Ineligible_Cooling_Off_Period_Not_Completed, label: 'Cooling off period not completed' },
-+  { value: CaseStatus.Ineligible_Eligible_For_State_Process, label: 'Eligible for state process' },
-+  { value: CaseStatus.Ineligible_Exceeded_Four_Day_Timeline, label: 'Exceeded four-day timeline' },
-+  { value: CaseStatus.Ineligible_Incorrectly_Batched, label: 'Incorrectly batched' },
-+  { value: CaseStatus.Ineligible_Incorrectly_Bundled, label: 'Incorrectly bundled' },
-+  { value: CaseStatus.Ineligible_Item_Or_Service_Not_Covered_By_Plan, label: 'Item or service not covered by plan' },
-+  { value: CaseStatus.Ineligible_Item_Or_Service_Not_NSA_Eligible, label: 'Item or service not NSA-eligible' },
-+  { value: CaseStatus.Ineligible_Notice_Of_Initiation_Not_Submitted, label: 'Notice of initiation not submitted' },
-+  { value: CaseStatus.Ineligible_Open_Negotiation_Not_Complete, label: 'Open negotiation not complete' },
-+  { value: CaseStatus.Ineligible_Open_Negotiation_Not_Initiated, label: 'Open negotiation not initiated' },
-+  { value: CaseStatus.Ineligible_Other, label: 'Other' },
-+  { value: CaseStatus.Ineligible_Plan_Not_Subject_To_NSA, label: 'Plan not subject to NSA' },
-+  { value: CaseStatus.Ineligible_Prior_To_Applicable_Policy_Year, label: 'Prior to applicable policy year' },
-+].sort((a, b) => a.label.localeCompare(b.label));
+@@ -18,11 +18,28 @@
  
  type Reason = keyof typeof CaseClosureReason;
  
-@@ -51,6 +67,7 @@
-   const [reason, setReason] = useState<Reason | ''>('');
-   const [notes, setNotes] = useState('');
-   const [files, set
++const INELIGIBLE_REASON_OPTIONS = [
++  { value: "INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED", label: "Ineligible – Cooling off period not completed" },
++  { value: "INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS", label: "Ineligible – Eligible for state process" },
++  { value: "INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE", label: "Ineligible – Exceeded four-day timeline" },
++  { value: "INELIGIBLE_INCORRECTLY_BATCHED", label: "Ineligible – Incorrectly batched" },
++  { value: "INELIGIBLE_INCORRECTLY_BUNDLED", label: "Ineligible – Incorrectly bundled" },
++  { value: "INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED", label: "Ineligible – Item or service not covered by plan" },
++  { value: "INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE", label: "Ineligible – Item or service not NSA-eligible" },
++  { value: "INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED", label: "Ineligible – Notice of initiation not submitted" },
++  { value: "INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE", label: "Ineligible – Open negotiation not complete" },
++  { value: "INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED", label: "Ineligible – Open negotiation not initiated" },
++  { value: "INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA", label: "Ineligible – Plan not subject to NSA" },
++  { value: "INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR", label: "Ineligible – Prior to applicable policy year" },
++  { value: "INELIGIBLE_OTHER", label: "Ineligible – Other" },
++] as const;
++
+ // Early Stage Options (Path 1) - When case is in INITIAL_ELIGIBILITY_REVIEW
+ // Entity fee = $0, only admin fee required
+ // Note: Withdrawal, Settlement, and Other are on case card buttons
+ const EARLY_STAGE_OPTIONS = [
+-  { value: "EARLY_INELIGIBLE", label: "Ineligible" },
++  ...INELIGIBLE_REASON_OPTIONS,
+   { value: "EARLY_RESUBMISSION", label: "Resubmission" },
+   { value: "EARLY_WITHDRAWAL", 
 ... (truncated — see full diff in files)
 ```
 
 ### `lib/actions/administrative-closure.ts` (modify)
-This change modifies the `closeCaseAdministrative` server action to accept and process the new `ineligibleSubStatus`. It adds validation to ensure a valid sub-status is provided when a case is closed as `EARLY_INELIGIBLE` and uses this sub-status to update the case record in the database, replacing the generic `INELIGIBLE` status.
+This change updates the backend server action to handle the new ineligible closure reasons. It introduces a mapping from the new `CaseClosureReason` values to the corresponding `CaseStatus` sub-statuses. It also ensures that all new ineligible reasons correctly result in a 0% entity fee, maintaining business logic consistency.
 ```typescript
 --- a/lib/actions/administrative-closure.ts
 +++ b/lib/actions/administrative-closure.ts
-@@ -1,5 +1,5 @@
- 'use server';
--import { CaseStatus } from '@prisma/client';
-+import { CaseStatus } from '@prisma/client'; // Keep existing import
- import { revalidatePath } from 'next/cache';
- import { z } from 'zod';
- import { prisma } from '@/lib/prisma';
-@@ -21,6 +21,7 @@
-   reason: z.nativeEnum(CaseClosureReason),
-   notes: z.string().optional(),
-   files: z.array(z.object({ key: z.string(), name: z.string() })).optional(),
-+  ineligibleSubStatus: z.nativeEnum(CaseStatus).optional(),
- });
+@@ -1,6 +1,6 @@
+ "use server";
  
- export async function closeCaseAdministrative(
-@@ -52,8 +53,12 @@
-   let newStatus: CaseStatus;
+-import { CaseClosureReason, CaseStatus } from "@/lib/types/shared-enums";
++import { CaseClosureReason, CaseStatus } from "@/lib/types/shared-enums";
+ import { prisma } from "@/lib/prisma";
+ import { revalidatePath } from "next/cache";
+ import { z } from "zod";
+@@ -8,6 +8,22 @@
+ import { getCaseWithPartiesAndPayments } from "@/lib/queries/get-case-with-parties-and-payments";
+ import { createCaseAction } from "./case-action";
  
-   switch (reason) {
--    case CaseClosureReason.EARLY_INELIGIBLE:
--      newStatus = CaseStatus.INELIGIBLE;
-+    case CaseClosureReason.EARLY_INELIGIBLE: {
-+      if (!ineligibleSubStatus || !Object.values(CaseStatus).includes(ineligibleSubStatus)) {
-+        return { success: false, message: 'A valid ineligibility reason must be provided.' };
-+      }
-+      newStatus = ineligibleSubStatus;
-       break;
-+    }
-     case CaseClosureReason.DISMISSAL:
-       newStatus = CaseStatus.NOTICE_OF_DISMISSAL_NON_PAYMENT;
-       break;
++const INELIGIBLE_REASON_TO_STATUS_MAP: Partial<Record<CaseClosureReason, CaseStatus>> = {
++  [CaseClosureReason.INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED]: CaseStatus.INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED,
++  [CaseClosureReason.INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS]: CaseStatus.INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS,
++  [CaseClosureReason.INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE]: CaseStatus.INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE,
++  [CaseClosureReason.INELIGIBLE_INCORRECTLY_BATCHED]: CaseStatus.INELIGIBLE_INCORRECTLY_BATCHED,
++  [CaseClosureReason.INELIGIBLE_INCORRECTLY_BUNDLED]: CaseStatus.INELIGIBLE_INCORRECTLY_BUNDLED,
++  [CaseClosureReason.INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED]: CaseStatus.INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED,
++  [CaseClosureReason.INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE]: CaseStatus.INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE,
++  [CaseClosureReason.INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED]: CaseStatus.INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED,
++  [CaseClosureReason.INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE]: CaseStatus.INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE,
++  [CaseClosureReason.INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED]: CaseStatus.INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED,
++  [CaseClosureReason.INELIGIBLE_OTHER]: CaseStatus.INELIGIBLE_OTHER,
++  [CaseClosureReason.INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA]: CaseStatus.INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA,
++  [CaseClosureReason.INELIGIBLE_
+... (truncated — see full diff in files)
 ```
 
-### `app/app/cases/components/cases-page-client.tsx` (modify)
-This change adds the new ineligible sub-statuses to the status filter dropdown on the main cases page. This allows users to filter the case list by each specific ineligibility reason, fulfilling a core requirement of the ticket.
+### `components/eligibility/eligibility-dashboard.tsx` (modify)
+This change adds the new ineligible sub-statuses to the status filter on the eligibility dashboard. This allows users to filter and view cases by specific ineligibility reasons, fulfilling a key reporting requirement of the ticket.
 ```
---- a/app/app/cases/components/cases-page-client.tsx
-+++ b/app/app/cases/components/cases-page-client.tsx
-@@ -31,6 +31,20 @@
-   { value: 'FINAL_DETERMINATION_PENDING', label: 'Final Determination Pending' },
-   { value: 'FINAL_DETERMINATION_RENDERED', label: 'Final Determination Rendered' },
-   { value: 'INELIGIBLE', label: 'Ineligible' },
-+  { value: 'Ineligible_Cooling_Off_Period_Not_Completed', label: 'Ineligible – Cooling off period not completed' },
-+  { value: 'Ineligible_Eligible_For_State_Process', label: 'Ineligible – Eligible for state process' },
-+  { value: 'Ineligible_Exceeded_Four_Day_Timeline', label: 'Ineligible – Exceeded four-day timeline' },
-+  { value: 'Ineligible_Incorrectly_Batched', label: 'Ineligible – Incorrectly batched' },
-+  { value: 'Ineligible_Incorrectly_Bundled', label: 'Ineligible – Incorrectly bundled' },
-+  { value: 'Ineligible_Item_Or_Service_Not_Covered_By_Plan', label: 'Ineligible – Item or service not covered by plan' },
-+  { value: 'Ineligible_Item_Or_Service_Not_NSA_Eligible', label: 'Ineligible – Item or service not NSA-eligible' },
-+  { value: 'Ineligible_Notice_Of_Initiation_Not_Submitted', label: 'Ineligible – Notice of initiation not submitted' },
-+  { value: 'Ineligible_Open_Negotiation_Not_Complete', label: 'Ineligible – Open negotiation not complete' },
-+  { value: 'Ineligible_Open_Negotiation_Not_Initiated', label: 'Ineligible – Open negotiation not initiated' },
-+  { value: 'Ineligible_Other', label: 'Ineligible – Other' },
-+  { value: 'Ineligible_Plan_Not_Subject_To_NSA', label: 'Ineligible – Plan not subject to NSA' },
-+  { value: 'Ineligible_Prior_To_Applicable_Policy_Year', label: 'Ineligible – Prior to applicable policy year' },
-   { value: 'INELIGIBLE_PENDING_ADMIN_FEE', label: 'Ineligible Pending Admin Fee' },
-   { value: 'CLOSED_DEFAULT', label: 'Closed - Default' },
-   { value: 'CLOSED_DEFAULT_IP', label: 'Closed - Default IP' },
+--- a/components/eligibility/eligibility-dashboard.tsx
++++ b/components/eligibility/eligibility-dashboard.tsx
+@@ -10,6 +10,20 @@
+ const STATUS_OPTIONS = [
+   { value: "INITIAL_ELIGIBILITY_REVIEW", label: "Initial Eligibility Review" },
+   { value: "INELIGIBLE", label: "Ineligible" },
++  { value: "INELIGIBLE_COOLING_OFF_PERIOD_NOT_COMPLETED", label: "Ineligible – Cooling off period not completed" },
++  { value: "INELIGIBLE_ELIGIBLE_FOR_STATE_PROCESS", label: "Ineligible – Eligible for state process" },
++  { value: "INELIGIBLE_EXCEEDED_FOUR_DAY_TIMELINE", label: "Ineligible – Exceeded four-day timeline" },
++  { value: "INELIGIBLE_INCORRECTLY_BATCHED", label: "Ineligible – Incorrectly batched" },
++  { value: "INELIGIBLE_INCORRECTLY_BUNDLED", label: "Ineligible – Incorrectly bundled" },
++  { value: "INELIGIBLE_ITEM_OR_SERVICE_NOT_COVERED", label: "Ineligible – Item or service not covered by plan" },
++  { value: "INELIGIBLE_ITEM_OR_SERVICE_NOT_NSA_ELIGIBLE", label: "Ineligible – Item or service not NSA-eligible" },
++  { value: "INELIGIBLE_NOTICE_OF_INITIATION_NOT_SUBMITTED", label: "Ineligible – Notice of initiation not submitted" },
++  { value: "INELIGIBLE_OPEN_NEGOTIATION_NOT_COMPLETE", label: "Ineligible – Open negotiation not complete" },
++  { value: "INELIGIBLE_OPEN_NEGOTIATION_NOT_INITIATED", label: "Ineligible – Open negotiation not initiated" },
++  { value: "INELIGIBLE_OTHER", label: "Ineligible – Other" },
++  { value: "INELIGIBLE_PLAN_NOT_SUBJECT_TO_NSA", label: "Ineligible – Plan not subject to NSA" },
++  { value: "INELIGIBLE_PRIOR_TO_APPLICABLE_POLICY_YEAR", label: "Ineligible – Prior to applicable policy year" },
+   { value: "FINAL_ELIGIBILITY_REVIEW", label: "Final Eligibility Review" },
+   { value: "PENDING_INITIAL_RFI", label: "Pending Initial RFI" },
+   { value: "PENDING_RFI", label: "Pending RFI" },
+```
+
+### `lib/actions/eligibility.ts` (modify)
+This change enhances the `getEligibilityCases` action to support filtering by an array of statuses. This is necessary for the multi-select status filter on the eligibility dashboard to function correctly with the newly added sub-statuses. The change is backward-compatible, continuing to support filtering by a single status.
+```typescript
+--- a/lib/actions/eligibility.ts
++++ b/lib/actions/eligibility.ts
+@@ -1,12 +1,12 @@
+ "use server";
+ 
+ import { prisma } from "@/lib/prisma";
+-import { CaseStatus } from "@prisma/client";
++import { CaseStatus, Prisma } from "@prisma/client";
+ import { getSession } from "@/lib/auth/session";
+ 
+ export async function getEligibilityCases(filters: {
+   page?: number;
+-  status?: CaseStatus;
++  status?: CaseStatus | CaseStatus[];
+   search?: string;
+ }) {
+   const session = await getSession();
+@@ -19,10 +19,14 @@
+   const take = 20;
+   const skip = (page - 1) * take;
+ 
+-  const where = {
++  const where: Prisma.CaseWhereInput = {
+     // some existing conditions
+-    ...(filters.status && { status: filters.status }),
++    ...(filters.status && {
++      status: Array.isArray(filters.status)
++        ? { in: filters.status }
++        : filters.status,
++    }),
+     ...(search && {
+       OR: [
+         { disputeReferenceNumber: { contains: search } },
 ```
 
 **New Dependencies:**
-- `(none)`
+- `None`
 
 ## Test Suggestions
 
-Framework: `Vitest`
+Framework: `Jest/Vitest`
 
-- **shouldRenderSubStatusSelectWhenIneligibleIsChosen** — Verifies that the sub-status dropdown is conditionally rendered only when the "Ineligible" status is selected.
-- **shouldShowValidationErrorIfIneligibleButNoSubStatusIsSelected** *(edge case)* — Ensures the sub-status is required when a case is being closed as ineligible.
-- **shouldCallServerActionWithCorrectSubStatusOnSubmit** — Verifies the happy path where the form is submitted correctly with the selected ineligible sub-status.
-- **shouldUpdateCaseWithIneligibleSubStatusWhenProvided** — Tests the happy path for the server action, ensuring it correctly updates the case with the new specific sub-status.
-- **shouldThrowErrorWhenClosingAsIneligibleWithoutSubStatus** *(edge case)* — Tests the error handling path where a case is marked ineligible without specifying the required reason.
-- **shouldSuccessfullyCloseCaseWithNonIneligibleStatus** — This is a regression test to ensure that existing administrative closure reasons continue to function as expected without being affected by the new sub-status logic.
-- **shouldDisplayNewIneligibleSubStatusesInFilterDropdown** — Verifies that the new ineligible sub-statuses are available as filtering options on the main cases page UI.
+- **shouldRenderAllIneligibleSubStatusOptions** — Verifies that the administrative closure modal correctly renders the new, specific ineligible sub-status options in the dropdown menu for the user to select.
+- **shouldCallCloseCaseActionWithSelectedReasonOnSubmit** — Ensures that when a user selects a specific ineligibility reason and submits the form, the correct server action is invoked with the appropriate payload.
+- **shouldUpdateStatusAndSetZeroFeeForIneligibleCoolingOff** — This is a happy path test to verify that the server action correctly maps a specific ineligible closure reason to its corresponding case status and applies the correct business logic (0% entity fee).
+- **shouldThrowErrorForUnknownClosureReason** *(edge case)* — This edge case test ensures the action is robust and fails safely when it receives an unexpected input, preventing invalid data from being written to the database.
+- **shouldFilterCasesByAnArrayOfStatuses** — Verifies the primary change in the action, ensuring it can correctly filter cases by a list of multiple statuses, which is required for the dashboard's multi-select filter.
+- **shouldMaintainBackwardCompatibilityForSingleStatusFilter** *(edge case)* — This regression test ensures that the changes to support array-based filtering do not break the existing functionality where a single status string is passed.
+- **shouldFilterDashboardByNewIneligibleSubStatuses** — This test verifies that the UI correctly displays the new filter options and that user interaction with these filters triggers the appropriate data-fetching logic with the correct parameters.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the end-to-end case lifecycle and statuses. The ticket proposes changing one of these core statuses ('Ineligible'), making this document essential for understanding the current state and the impact of the change.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This page identifies that case status transitions related to closure types, including 'Ineligible', are a 'major complexity hotspot' and a source of high-impact bugs. This is a critical operational constraint for a developer to consider when modifying the 'Ineligible' status.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the end-to-end case lifecycle and is the canonical reference for all dispute statuses. The ticket requires modifying the 'Ineligible' status, which is a key part of this workflow.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This page identifies that status transitions for closure types, specifically including 'Ineligible', are a 'major complexity hotspot' and a source of high-impact production issues. This is a critical operational constraint for a developer to consider when implementing changes to status logic.
 
 **Suggested Documentation Updates:**
 
-- IDRE Worflow: This page is the canonical reference for the case lifecycle. It needs to be updated to include the new 'Ineligible' sub-statuses and the requirement to select one when closing a case as ineligible.
+- IDRE Worflow: This document is the canonical reference for the case lifecycle and will need to be updated to include the new 'Ineligible' sub-statuses.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 85%, Tests: 95%
+Plan: 90%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

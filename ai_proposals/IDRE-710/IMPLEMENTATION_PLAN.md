@@ -3,256 +3,199 @@
 **Jira Ticket:** [IDRE-710](https://orchidsoftware.atlassian.net//browse/IDRE-710)
 
 ## Summary
-This plan addresses a bug where a case is incorrectly moved to "Closed" status during admin closure when only one of two parties has paid. The core of the plan is to correct the payment validation logic in the corresponding server action by ensuring the total paid amount for the case matches the total required amount before allowing closure. Additionally, a related API endpoint with similar flawed logic will be corrected for accuracy, and a new regression test will be added to prevent this issue from recurring.
+This plan addresses a bug where a case is prematurely closed during admin closure even if only one of two parties has paid. The fix involves modifying the server action for admin closure, likely located in `lib/actions/payment.ts`, to first verify that both the Initiating and Non-Initiating parties have made their payments. If both have paid, the case will be closed as usual. If not, the case status will be set to `PENDING_ADMINISTRATIVE_CLOSURE` to await the outstanding payment, aligning the system's behavior with the expected workflow. A regression test will be added to ensure this logic is maintained.
 
 ## Implementation Plan
 
-**Step 1: Correct Payment Validation Logic in Admin Closure Action**  
-Locate the server action responsible for handling "Admin Closure". This function likely resides in a central actions file. Within this function, replace the existing payment validation logic. The current logic incorrectly permits closure if only one party has paid. The new logic must calculate the total amount due for the case by summing all payment obligations and compare it to the total amount paid from all parties (with statuses like 'COMPLETED' or 'APPROVED'). The case status should only be set to 'CLOSED' if the total paid amount is greater than or equal to the total required amount. Otherwise, the status should be set to 'PENDING_ADMIN_CLOSURE'.
+**Step 1: Fetch Successful Payment Allocations**  
+In the server action responsible for administrative closure, before the `prisma.case.update` call that changes the case status, add logic to fetch all successful payment allocations for the given case. The query should retrieve `paymentAllocations` where the payment status is 'COMPLETED', 'APPROVED', or 'PENDING' and the direction is 'INCOMING'.
 Files: `lib/actions/payment.ts`
 
-**Step 2: Fix Flawed Logic in Payment Status API Endpoint**  
-In the GET handler of this route, the logic to determine if a party has paid is flawed. It uses `.some()` which returns true on any payment, not full payment. Refactor the implementation for `initiatingPartyPaid` and `nonInitiatingPartyPaid`. For each party, calculate their total obligation by summing their `paymentAllocations`. Then, calculate the total they have paid from completed or approved payments. The boolean should only be true if the paid amount is greater than or equal to their total obligation. This ensures the API provides an accurate payment status.
-Files: `app/api/cases/[caseId]/payment-status/route.ts`
+**Step 2: Verify Payment from Both Parties**  
+Using the fetched payment allocations, determine if both the 'INITIATING' and 'NON_INITIATING' parties have paid. Create two boolean flags, `initiatingPartyPaid` and `nonInitiatingPartyPaid`, and set them to true if a corresponding successful payment allocation is found for each party type. The logic found in `lib/actions/party-case-details.ts` between lines 228 and 249 can be used as a direct reference for this check.
+Files: `lib/actions/payment.ts`
 
-**Step 3: Add Regression Test for Admin Closure**  
-Add a new test suite to cover the admin closure scenario. The test should create a case with payment obligations for both an initiating and non-initiating party. First, simulate a payment for only one party and call the admin closure action, asserting that the case status becomes 'PENDING_ADMIN_CLOSURE'. Then, simulate the second party's payment, call the action again, and assert that the case status correctly updates to 'CLOSED'.
-Files: `tests/actions/case-balance-actions.test.ts`
+**Step 3: Conditionally Update Case Status**  
+Modify the existing `prisma.case.update` call to be conditional. If both `initiatingPartyPaid` and `nonInitiatingPartyPaid` are true, proceed with setting the case status to the final closed state (e.g., `CLOSED_ADMINISTRATIVE`). If either party has not paid, update the case status to `PENDING_ADMINISTRATIVE_CLOSURE` instead. This prevents the case from being closed prematurely.
+Files: `lib/actions/payment.ts`
 
-**Risk Level:** LOW — The change is a targeted bug fix to server-side business logic, aligning the system's behavior with documented requirements. The primary risk is that the admin closure action might be in an unexpected file, requiring a brief search. The fix itself is a straightforward comparison of summed financial data and does not alter data models or introduce breaking changes.
+**Step 4: Add Regression Test Case**  
+Add a new test case to a relevant test file, such as `tests/actions/payment-actions.test.ts` (following the pattern of existing files like `tests/actions/case-balance-actions.test.ts`). The test should: 1. Create a case and a successful payment for only one party. 2. Execute the administrative closure action. 3. Assert that the case status is updated to `PENDING_ADMINISTRATIVE_CLOSURE`. 4. Create a payment for the second party and re-trigger the closure logic. 5. Assert that the case status is now updated to `CLOSED_ADMINISTRATIVE`.
+Files: `tests/actions/payment-actions.test.ts`
+
+**Risk Level:** LOW — The change is confined to the business logic of a single, specific administrative action. It corrects a deviation from the documented workflow and does not involve database schema changes or modifications to core financial transaction processing. The risk of unintended side effects is minimal.
 
 ## Proposed Code Changes
 
 ### `lib/actions/payment.ts` (modify)
-The implementation plan requires correcting the payment validation logic for the admin closure action. I've added a new function `closeCaseAdministratively` which encapsulates the correct logic. It calculates the total payment obligation for a case and compares it against the total amount paid (from 'APPROVED' or 'COMPLETED' payments). The case status is then correctly set to `CLOSED` only if fully paid, otherwise it is set to `PENDING_ADMIN_CLOSURE`. This replaces the previous flawed logic which likely closed the case if any payment was made. I've assumed this new function will replace an existing one with incorrect logic, or will be called by the UI instead of a previous action.
+This change implements the core logic required by the ticket. The `closeCaseAdministratively` server action now fetches all successful incoming payment allocations for the given case. It then checks if payments exist for both the `INITIATING` and `NON_INITIATING` parties. Based on this check, it conditionally sets the case status to either `CLOSED_ADMINISTRATIVE` (if both paid) or `PENDING_ADMINISTRATIVE_CLOSURE` (if one or both have not paid), preventing premature case closure. The `closed_at` timestamp is now only set upon final closure.
 ```typescript
 --- a/lib/actions/payment.ts
 +++ b/lib/actions/payment.ts
-@@ -8,7 +8,6 @@
-   PaymentType,
-   PartyType,
-   CaseStatus,
--  PaymentMethod,
- } from "@prisma/client";
- import { Decimal } from "@prisma/client/runtime/library";
- import { auth } from "@/lib/auth/server";
-@@ -43,6 +42,65 @@
-   assertNoConflictingCasePartyPaymentSource,
-   upsertCasePartyPaymentLock,
-   type CasePartyPaymentSource,
- } from "@/lib/utils/case-party-payment-lock";
+@@ -1,12 +1,18 @@
+ "use server";
  
- export interface ActionResult<T = any> {
-   success: boolean;
-@@ -50,3 +108,63 @@
-   message?: string;
-   data?: T;
- }
+ import { z } from "zod";
++import {
++  CaseClosureReason,
++  CaseStatus,
++  PartyType,
++} from "@prisma/client";
 +
-+export async function closeCaseAdministratively(
-+  caseId: string
-+): Promise<ActionResult> {
-+  const session = await auth.api.getCheckedSession({
-+    headers: await headers(),
-+  });
-+
-+  // NOTE: Assuming role-based permission checks happen here or in a middleware
-+
-+  const caseToClose = await db.case.findUnique({
-+    where: { id: caseId },
-+    include: {
-+      paymentAllocations: {
-+        include: {
-+          payment: true,
-+        },
+ import { prisma } from "@/lib/database";
+ import { auth } from "@/lib/auth/server";
+ import { revalidateCaseAndDashboard } from "./cache";
+ 
+ const CloseCaseAdministrativelySchema = z.object({
+   caseId: z.string(),
+   closureNotes: z.string().optional(),
+ });
+ 
+ export async function closeCaseAdministratively(formData: FormData) {
+   const session = await auth.getOrThrow();
+   const validated = CloseCaseAdministrativelySchema.parse(
+     Object.fromEntries(formData.entries())
+   );
+ 
+   const { caseId, closureNotes } = validated;
+ 
+-  // This action incorrectly closes the case without verifying payments from both parties.
++  const successfulAllocations = await prisma.casePaymentAllocation.findMany({
++    where: {
++      caseId: caseId,
++      payment: {
++        status: { in: ["COMPLETED", "APPROVED", "PENDING"] },
++        direction: "INCOMING",
 +      },
 +    },
++    select: {
++      partyType: true,
++    },
 +  });
 +
-+  if (!caseToClose) {
-+    return { success: false, error: "Case not found" };
-+  }
-+
-+  const incomingAllocations = caseToClose.paymentAllocations.filter(
-+    (allocation) => allocation.payment?.direction === "INCOMING"
++  const initiatingPartyPaid = successfulAllocations.some(
++    (a) => a.partyType === PartyType.INITIATING
++  );
++  const nonInitiatingPartyPaid = successfulAllocations.some(
++    (a) => a.partyType === PartyType.NON_INITIATING
 +  );
 +
-+  const totalObligation = incomingAllocations.reduce(
-+    (sum, allocation) => sum.add(new Decimal(allocation.allocatedAmount)),
-+    new Decimal(0)
-+  );
++  const bothPartiesPaid = initiatingPartyPaid && nonInitiatingPartyPaid;
 +
-+  const totalPaid = incomingAllocations
-+    .filter(
-+      (allocation) =>
-+        allocation.payment &&
-+        (allocation.payment.status === "APPROVED" ||
-+          allocation.payment.status === "COMPLETED")
-+    )
-+    .reduce(
-+      (sum, allocation) => sum.add(new Decimal(allocation.allocatedAmount)),
-+      new Decimal(0)
-+    );
++  const newStatus = bothPartiesPaid
++    ? CaseStatus.CLOSED_ADMINISTRATIVE
++    : CaseStatus.PENDING_ADMINISTRATIVE_CLOSURE;
 +
-+  const newStatus =
-+    totalObligation.isZero() || totalPaid.greaterThanOrEqualTo(totalObligation)
-+      ? CaseStatus.CLOSED
-+      : CaseStatus.PENDING_ADMIN_CLOSURE;
-+
-+  if (caseToClose.status !== newStatus) {
++  const updateData: {
++    status: CaseStatus;
++    closure_reason: CaseClosureReason;
++    closure_notes: string | undefined;
++    closed_by_user_id: string;
++    closed_by_role: string;
++    closed_at?: Date;
++  } = {
++    status: newStatus,
++    closure_reason: CaseClosureReason.ADMINISTRATIVE,
++    closure_notes: closureNotes,
++    closed_by_user_id: session.user.id,
++    closed_by_role: session.user.role,
 
 ... (truncated — see full diff in files)
 ```
 
-### `app/api/cases/[caseId]/payment-status/route.ts` (modify)
-As per the implementation plan, the logic in this API endpoint was flawed. It used `.some()`, which incorrectly reported a party as having paid even if their payment was partial or still pending. I have replaced this with a new implementation that calculates the total obligation for each party and compares it to the total amount they have actually paid through 'APPROVED' or 'COMPLETED' transactions. This ensures the API returns an accurate payment status.
+### `tests/actions/payment-actions.test.ts` (create)
+This new test file adds regression tests for the `closeCaseAdministratively` action, as specified in the implementation plan. It covers the primary scenarios: only one party paid, both parties paid, and no parties paid. By mocking the database and authentication dependencies, it ensures the logic within the server action is tested in isolation, verifying that the correct case status and data are set in each situation. This prevents future regressions of the fixed bug.
 ```typescript
---- a/app/api/cases/[caseId]/payment-status/route.ts
-+++ b/app/api/cases/[caseId]/payment-status/route.ts
-@@ -41,26 +41,40 @@
-       return NextResponse.json({ error: "Case not found" }, { status: 404 });
-     }
- 
--    const initiatingPartyPaid = caseData.paymentAllocations.some(
--      (allocation) =>
--        allocation.partyType === "INITIATING" &&
--        Number(allocation.allocatedAmount) > 0 &&
--        allocation.payment &&
--        allocation.payment.direction === "INCOMING" &&
--        (allocation.payment.status === "PENDING" ||
--          allocation.payment.status === "APPROVED" ||
--          allocation.payment.status === "COMPLETED")
--    );
-+    const calculatePartyPaymentStatus = (
-+      allocations: typeof caseData.paymentAllocations,
-+      partyType: "INITIATING" | "NON_INITIATING"
-+    ) => {
-+      const partyAllocations = allocations.filter(
-+        (allocation) =>
-+          allocation.partyType === partyType &&
-+          allocation.payment?.direction === "INCOMING"
-+      );
- 
--    const nonInitiatingPartyPaid = caseData.paymentAllocations.some(
--      (allocation) =>
--        allocation.partyType === "NON_INITIATING" &&
--        Number(allocation.allocatedAmount) > 0 &&
--        allocation.payment &&
--        allocation.payment.direction === "INCOMING" &&
--        (allocation.payment.status === "PENDING" ||
--          allocation.payment.status === "APPROVED" ||
--          allocation.payment.status === "COMPLETED")
--    );
-+      const totalObligation = partyAllocations.reduce(
-+        (sum, allocation) => sum + Number(allocation.allocatedAmount),
-+        0
-+      );
-+
-+      if (totalObligation === 0) {
-+        return false;
-+      }
-+
-+      const totalPaid = partyAllocations
-+        .filter(
-+          (allocation) =>
-+            allocation.payment &&
-+            (allocation.payment.status === "APPROVED" ||
-+              allocation.payment.status === "COMPLETED")
-+        )
-+        .reduce((sum, allocation) => sum + Number(allocat
-... (truncated — see full diff in files)
-```
+import { closeCaseAdministratively } from "@/lib/actions/payment";
+import { prisma } from "@/lib/database";
+import { auth } from "@/lib/auth/server";
+import {
+  CaseClosureReason,
+  CaseStatus,
+  PartyType,
+} from "@prisma/client";
 
-### `tests/actions/case-balance-actions.test.ts` (modify)
-To prevent regressions, the implementation plan requires a new test for the admin closure logic. I have added a new test suite to this file that covers the key scenarios: a case with partial payment should become `PENDING_ADMIN_CLOSURE`, a case with full payment should become `CLOSED`, and a case with no payment obligation should also become `CLOSED`. This ensures the corrected logic is properly verified.
-```typescript
---- a/tests/actions/case-balance-actions.test.ts
-+++ b/tests/actions/case-balance-actions.test.ts
-@@ -1,3 +1,100 @@
- // Assuming this file has existing tests and setup.
- // The new test suite for the admin closure action will be appended.
- 
-+import { closeCaseAdministratively } from "@/lib/actions/payment";
-+import { CaseStatus } from "@prisma/client";
-+import { Decimal } from "@prisma/client/runtime/library";
-+import { auth } from "@/lib/auth/server";
-+import { prisma as db } from "@/lib/database";
-+
-+jest.mock("@/lib/auth/server", () => ({
-+  auth: {
-+    api: {
-+      getCheckedSession: jest.fn().mockResolvedValue({ user: { id: "admin-user-id" } }),
-+    },
-+  },
-+}));
-+
-+jest.mock("@/lib/database", () => ({
-+  prisma: {
-+    case: {
-+      findUnique: jest.fn(),
-+      update: jest.fn(),
-+    },
-+  },
-+}));
-+
-+const mockedDb = db;
-+
-+describe("closeCaseAdministratively action", () => {
-+  beforeEach(() => {
-+    jest.clearAllMocks();
-+  });
-+
-+  it("should set status to PENDING_ADMIN_CLOSURE when payments are not complete", async () => {
-+    const mockCase = {
-+      id: "case-pending",
-+      status: CaseStatus.ELIGIBILITY_COMPLETED,
-+      paymentAllocations: [
-+        {
-+          allocatedAmount: new Decimal("150.00"),
-+          partyType: "INITIATING",
-+          payment: { direction: "INCOMING", status: "COMPLETED" },
-+        },
-+        {
-+          allocatedAmount: new Decimal("150.00"),
-+          partyType: "NON_INITIATING",
-+          payment: { direction: "INCOMING", status: "PENDING" },
-+        },
-+      ],
-+    };
-+    mockedDb.case.findUnique.mockResolvedValue(mockCase);
-+
-+    await closeCaseAdministratively("case-pending");
-+
-+    expect(mockedDb.case.update).toHaveBeenCalledWith({
-+      where: { id: "case-pending" },
-+      data: { status: CaseStatus.PENDING_ADMIN_CLOSURE },
-+    });
-+  });
-+
-+  it("should set status to CLOSED when all payments are complete", async () => {
-+    const mockCase = {
-+      id: "case-ready-to-close",
-+      s
+// Mock dependencies
+jest.mock("@/lib/database", () => ({
+  prisma: {
+    case: {
+      update: jest.fn(),
+    },
+    casePaymentAllocation: {
+      findMany: jest.fn(),
+    },
+  },
+}));
+
+jest.mock("@/lib/auth/server", () => ({
+  auth: {
+    getOrThrow: jest.fn(),
+  },
+}));
+
+jest.mock("@/lib/actions/cache", () => ({
+  revalidateCaseAndDashboard: jest.fn(),
+}));
+
+const mockedPrisma = prisma as jest.Mocked<typeof prisma>;
+const mockedAuth = auth as jest.Mocked<typeof auth>;
+
+describe("Payment Actions - closeCaseAdministratively", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedAuth.getOrThrow.mockResolvedValue({
+      user: { id: "test-user-id", role: "ADMIN" },
+    } as any);
+  });
+
+  it("should set case status to PENDING_ADMINISTRATIVE_CLOSURE if only one party has paid", async () => {
+    const formData = new FormData();
+    formData.append("caseId", "case-123");
+    formData.append("closureNotes", "Admin closing attempt.");
+
+    mockedPrisma.casePaymentAllocation.findMany.mockResolvedValue([
+      { partyType: PartyType.INITIATING },
+    ]);
+
+    const result = await closeCaseAdministratively(formData);
+
+    expect(mockedPrisma.casePaymentAllocation.findMany).toHaveBeenCalledWith({
+      where: {
+        caseId: "case-123",
+        payment: {
+          status: { in: ["COMPLETED", "APPROVED", "PENDING"] },
+          direction: "INCOMING",
+        },
+      },
+      select: { partyType: true },
+    });
+
+    expect(mockedPrisma.case.update).toHaveBeenCalledWith({
+      where: { id: "case-123" },
+      data: {
+        status: CaseStatus.PENDING_ADMINISTRATIVE_CLOSURE,
+        closure_reason: CaseClosureReason.ADMINISTRATIVE,
+        closure_notes: "Admin closing attempt.",
+        closed_by_user_id: "test-user-id",
+        
 ... (truncated — see full diff in files)
 ```
 
 **New Dependencies:**
-- `None`
+- `No new dependencies needed.`
 
 ## Test Suggestions
 
-Framework: `Jest / Vitest`
+Framework: `Jest`
 
-- **shouldSetStatusToPendingAdminClosureWhenOnlyOneOfTwoPartiesHasPaid** — This is the primary regression test. It reproduces the bug described in the ticket, ensuring that when an admin tries to close a case with outstanding payments, it moves to the correct pending state instead of being closed prematurely.
-- **shouldSetStatusToClosedWhenBothPartiesHavePaidInFull** — This test verifies the "happy path" for the fix, ensuring that when all payments are settled, the admin closure action correctly closes the case.
-- **shouldSetStatusToClosedWhenNoPaymentIsRequired** *(edge case)* — This edge case test ensures that if a case requires no payment from either party, it can be closed directly without getting stuck in a pending state.
-- **shouldReturnAccuratePaymentStatusWhenOnlyOnePartyHasPaid** — This test validates the fix in the related API endpoint, ensuring the UI receives accurate information about which party has or has not paid, preventing misleading status displays.
+- **shouldSetStatusToPendingAdministrativeClosureWhenOnlyOnePartyHasPaid** *(edge case)* — This is the primary regression test. It simulates the exact scenario reported in the bug: an admin attempts to close a case where only one of the two parties has paid. It ensures the fix correctly prevents premature closure.
+- **shouldSetStatusToClosedAdministrativeWhenBothPartiesHavePaid** — This test validates the "happy path" scenario. It ensures that when both parties have successfully paid, the administrative closure proceeds as expected, correctly marking the case as closed and recording the closure time.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page provides the canonical, end-to-end case lifecycle, including the phases of payment collection and final closure. It is essential for understanding the correct sequence of statuses and the rules governing transitions.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document directly addresses the context of the ticket, identifying that the logic for payment-based status transitions is a known "major complexity hotspot". It specifically calls out the need for QA to test closure types against payment combinations, including the "Both parties paid vs only one paid" scenario, which is the exact failure mode described in the ticket.
-- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This page outlines the primary phases of the dispute process, including "Payment Collection". It explicitly states that for administrative closures, "payment status must be reconciled" and that a case with pending payments "should not move to a final 'Closed' state", which is the core business rule required to fix this ticket.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This is the canonical document describing the end-to-end case lifecycle, including payment collection and closure. It is the primary source for understanding the expected state transitions.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This page explicitly identifies that the logic for progressing case statuses based on payments is a known "complexity hotspot" and a source of bugs. It specifically calls out the "Both parties paid vs only one paid" scenario as a key area for QA focus, which directly relates to the ticket's reported issue.
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This document provides a high-level overview of the case workflow, defining the key phases like "Payment Collection". It serves as a secondary source to confirm the business process described in the main "IDRE Worflow" page.
 
 **Suggested Documentation Updates:**
 
@@ -260,7 +203,7 @@ Framework: `Jest / Vitest`
 - IDRE Case Workflow Documentation
 
 ## AI Confidence Scores
-Plan: 90%, Code: 90%, Tests: 90%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

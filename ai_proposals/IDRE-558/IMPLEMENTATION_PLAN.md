@@ -3,184 +3,169 @@
 **Jira Ticket:** [IDRE-558](https://orchidsoftware.atlassian.net//browse/IDRE-558)
 
 ## Summary
-This plan addresses the issue of refunds appearing on the Banking Dashboard without required banking information. It involves three steps: 1) Filtering the `getApprovedPayments` data fetch to exclude refunds with a null `bankingSnapshot`. 2) Adding a server-side validation check to the refund approval action in `lib/actions/payment.ts` to prevent approval if ACH details are missing. 3) Updating the UI in `app/dashboard/payments/payments-client.tsx` to show an error toast if a user attempts to approve a refund without the necessary banking info. This ensures data integrity on the Banking Dashboard and provides clear user feedback.
+This plan addresses the issue of refunds appearing on the banking dashboard without necessary banking information. It introduces a three-part fix: 1) adding server-side validation to the refund approval action in `lib/actions/payment-approvals.ts` to block approvals for recipients without ACH details; 2) updating the payments dashboard UI in `app/dashboard/payments/payments-client.tsx` to display this validation error to the user; and 3) filtering the data query in `lib/actions/payment.ts` to hide any existing invalid refund records from the banking dashboard. This ensures data integrity for new refunds and cleans up the current view.
 
 ## Implementation Plan
 
-**Step 1: Filter out refunds with no banking info from Banking Dashboard**  
-In the `getApprovedPayments` function, modify the underlying database query (likely Prisma) to filter out records where the banking information is not present. Add a `where` clause to ensure the `bankingSnapshot` field is not null. This will prevent refunds without banking details from being displayed on the Banking Dashboard, satisfying the second acceptance criterion.
+**Step 1: Add Server-Side Validation to Refund Approval Action**  
+In the `approvePaymentFirstStage` server action, before any status change, add logic to verify that the recipient of the refund has approved ACH banking information on file. The function should fetch the payment details, identify the recipient party/organization, and check for an existing, valid banking setup. If no banking information is found for an ACH-based refund, the function should return a `{ success: false, error: "Cannot approve refund: Recipient is missing required ACH banking information." }` object and halt the approval process.
 Files: `lib/actions/payment-approvals.ts`
 
-**Step 2: Add server-side validation to refund approval action**  
-Locate the server action that approves a refund and transitions it to 'Ready for NACHA'. Before changing the payment status, add a validation check to ensure that the recipient party has valid ACH banking information on file. If the banking information is missing, prevent the status update and return an error object (e.g., `{ success: false, message: 'Cannot approve refund: Missing banking information for the recipient.' }`). This addresses the first and third acceptance criteria from the server side.
-Files: `lib/actions/payment.ts`
-
-**Step 3: Display UI error on approval failure**  
-In the Payments Dashboard client component, locate the handler function that calls the refund approval server action. Update this handler to process the return value from the action. If the action returns an error, use the existing toast notification system to display the error message to the user, informing them why the refund cannot be approved.
+**Step 2: Display Banking Info Validation Error in Payments Dashboard**  
+In the UI component for the payments dashboard, locate the handler function that calls the `approvePaymentFirstStage` action. Update this handler to properly manage the error state returned from the server action. If the `success` property in the response is `false`, use the `toast.error()` function to display the error message to the user, preventing them from approving a refund for a party with no banking details.
 Files: `app/dashboard/payments/payments-client.tsx`
 
-**Risk Level:** LOW — The proposed changes are low-risk as they involve adding validation and filtering, rather than modifying core financial transaction logic. The changes are confined to server-side data fetching and a single client-side component, minimizing the chance of unintended side effects. The primary risk is that the exact name of the approval action function in `lib/actions/payment.ts` might differ, requiring minor code exploration to locate it.
+**Step 3: Filter Banking Dashboard View to Hide Invalid Refunds**  
+Locate the data-fetching function that supplies payment data to the banking dashboard (e.g., `getPaymentsByStatus` or a similar function). Modify the database query to filter out any payments that have a status of 'Ready for NACHA Processing' (or equivalent) but do not have an associated banking snapshot. This will be achieved by adding a `where` clause to the Prisma query, such as `bankingSnapshot: { not: null }`. This ensures that existing records with missing data and any future records that might bypass the new validation are not displayed on the banking dashboard.
+Files: `lib/actions/payment.ts`
+
+**Risk Level:** LOW — The changes are confined to validation logic and data filtering, with a low risk of unintended side effects. The primary risk is that the validation logic in the server action might be overly strict or miss an edge case, but this can be mitigated with thorough testing. The UI changes are minimal and low-risk.
 
 ## Proposed Code Changes
 
 ### `lib/actions/payment-approvals.ts` (modify)
-This change ensures that the Banking Dashboard only displays payments and refunds that have a `bankingSnapshot` attached. By adding `bankingSnapshot: { not: null }` to the Prisma query's `where` clause in `getApprovedPayments`, we filter out any records that are missing this critical information, directly addressing the acceptance criterion to hide such records from the view.
+This change introduces server-side validation at the beginning of the `approvePaymentFirstStage` action. Before any status change occurs, it checks if the payment is an ACH refund. If so, it verifies that the recipient organization has a valid ACH payout bank account configured. This prevents the approval of refunds that cannot be processed, addressing the root cause of the issue.
 ```typescript
 --- a/lib/actions/payment-approvals.ts
 +++ b/lib/actions/payment-approvals.ts
-@@ -50,6 +50,9 @@
-     status: {
-       in: ["APPROVED", "READY_FOR_NACHA", "PROCESSING", "PAID", "RETURNED"],
-     },
-+    bankingSnapshot: {
-+      not: null,
-+    },
-   };
- 
-   if (filters.direction) {
-```
-
-### `lib/actions/payment.ts` (modify)
-This change introduces a critical server-side validation check. Before a payment's status can be updated to `APPROVED`, the `validateRefundApproval` helper function is called to verify that the recipient party has all the necessary ACH banking information on file. If the information is missing, the action fails and returns an error message, preventing refunds without banking details from entering the "Ready for NACHA" pipeline.
-```typescript
---- a/lib/actions/payment.ts
-+++ b/lib/actions/payment.ts
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,7 @@
  "use server";
  
-+import { PaymentStatus } from "@prisma/client";
+ import { prisma } from "@/lib/database";
++import { PaymentMethod, PaymentType } from "@prisma/client";
  import { revalidatePath } from "next/cache";
- import { prisma } from "@/lib/prisma";
- import {
-@@ -8,6 +9,42 @@
- } from "@/lib/schemas/payment";
- import { ServerActionResponse } from "../types/server-action";
- import { Payment } from "@prisma/client";
+ import { auth } from "@/lib/auth/server";
+ import { headers } from "next/headers";
+@@ -12,6 +13,54 @@
+   paymentId: string,
+   caseId: string
+ ) {
++  const session = await auth.api.getSession({ headers: await headers() });
++  if (!session) {
++    return { success: false, error: "Unauthorized" };
++  }
 +
-+async function validateRefundApproval(
-+  paymentId: string
-+): Promise<{ success: boolean; message?: string }> {
 +  const payment = await prisma.payment.findUnique({
 +    where: { id: paymentId },
-+    select: {
-+      recipientParty: {
++    include: {
++      // This relation is based on the Prisma schema. We assume the `CaseRefund` model,
++      // which is linked via `relatedRefundId`, contains the `recipientOrganizationId`.
++      case_refunds_payment_relatedRefundIdTocase_refunds: {
 +        select: {
-+          bankingInformation: true,
++          recipientOrganizationId: true,
 +        },
 +      },
 +    },
 +  });
 +
 +  if (!payment) {
-+    return { success: false, message: "Payment not found." };
++    return { success: false, error: "Payment not found." };
 +  }
 +
-+  const bankingInfo = payment.recipientParty?.bankingInformation;
++  // Add validation for ACH Refunds
 +  if (
-+    !bankingInfo ||
-+    !bankingInfo.bankName ||
-+    !bankingInfo.accountHolderName ||
-+    !bankingInfo.routingNumber ||
-+    !bankingInfo.accountNumber
++    payment.type === PaymentType.REFUND &&
++    payment.paymentMethod === PaymentMethod.ACH
 +  ) {
-+    return {
-+      success: false,
-+      message:
-+        "Cannot approve refund: Recipient is missing required ACH banking information.",
-+    };
-+  }
++    const recipientOrgId =
++      payment.case_refunds_payment_relatedRefundIdTocase_refunds
++        ?.recipientOrganizationId;
 +
-+  return { success: true };
-+}
- 
- export async function updatePayment(
-   paymentId: string,
-@@ -18,6 +55,14 @@
-     return { success: false, message: "Invalid data provided." };
-   }
- 
-+  // If moving to an approved state, validate banking info is present for the refund
-+  if (validatedFields.data.status === "APPROVED") {
-+    const validationResult = await validateRefundApproval(paymentId);
-+    if (!validationResult.success) {
-+      return validationResult;
++    if (!recipientOrgId) {
++      return {
++        success: false,
++        error: "Cannot approve refund: Recipient organization could not be determined.",
++      };
++    }
++
++    const recipientOrg = await prisma.organization.findUnique({
++      where: { id: recipientOrgId },
++      select: { refundPayoutBankAccountId: true },
++    });
++
++    if (!recipientOrg?.refundPayoutBankAccountId) {
++      return {
++        success: false,
++        error: "Cannot approve refund: Recipient is missing required ACH banking information.",
++      };
 +    }
 +  }
 +
-   try {
-     const updatedPayment = await prisma.payment.update({
-       where: { id: paymentId },
+   // TODO: Add more robust validation and user permission checks
+   // 
+... (truncated — see full diff in files)
 ```
 
 ### `app/dashboard/payments/payments-client.tsx` (modify)
-This change enhances the user experience by providing immediate feedback. The `handleApprove` function is updated to process the response from the `updatePayment` server action. If the action returns an error (e.g., due to missing banking information), an error toast is displayed to the user. If successful, a confirmation toast is shown. This fulfills the requirement to alert users when approval is not possible.
+This change updates the UI component responsible for handling payment approvals. It adds error handling to the `handleApprove` function to manage the new failure case from the `approvePaymentFirstStage` server action. If the server returns an error (e.g., missing banking information), a user-friendly toast notification is displayed, providing immediate feedback.
 ```
 --- a/app/dashboard/payments/payments-client.tsx
 +++ b/app/dashboard/payments/payments-client.tsx
-@@ -4,8 +4,9 @@
- import { PaymentsTable } from "./payments-table";
- import { PaymentFilters } from "@/lib/actions/payment";
- import { PaginationInfo } from "@/lib/types/pagination";
--import { useTransition } from "react";
-+import { useTransition, useCallback } from "react";
- import { updatePayment } from "@/lib/actions/payment";
-+import { toast } from "sonner";
- 
- interface PaymentsClientProps {
-   payments: any[]; // Define a proper type
-@@ -20,15 +21,20 @@
-   const [isPending, startTransition] = useTransition();
-   const router = useRouter();
- 
--  const handleApprove = (paymentId: string) => {
--    startTransition(async () => {
--      await updatePayment(paymentId, { status: "APPROVED" });
--      // Refresh data after update
--      router.refresh();
--    });
--  };
-+  const handleApprove = useCallback(
-+    (paymentId: string) => {
-+      startTransition(async () => {
-+        const result = await updatePayment(paymentId, { status: "APPROVED" });
-+        if (result.success) {
-+          toast.success("Refund approved and sent to banking.");
-+          router.refresh();
-+        } else {
-+          toast.error(result.message || "Failed to approve refund.");
-+        }
-+      });
-+    },
-+    [router, startTransition]
-+  );
- 
-   // Other handlers for deny, etc.
+@@ -28,10 +28,15 @@
+     setIsApproving(true);
+     try {
+       const result = await approvePaymentFirstStage(payment.id, payment.caseId);
+-      if (result.success) {
++      if (result?.success) {
+         toast.success("Payment approved successfully.");
+         router.refresh();
++      } else {
++        toast.error(
++          result.error || "Failed to approve payment. Please try again."
++        );
+       }
+     } catch (error) {
+       console.error("Failed to approve payment:", error);
+       toast.error("An unexpected error occurred while approving the payment.");
 ```
 
-**New Dependencies:**
-- `No new dependencies needed.`
+### `lib/actions/payment.ts` (modify)
+This change modifies the data-fetching action for the banking dashboard to filter out invalid records. By adding `bankingSnapshot: { not: null }` to the `where` clause for outgoing payments with an `APPROVED` status, we ensure that any existing or future refunds that incorrectly reach this state without banking details are hidden from the view. This cleans up the user interface and prevents confusion.
+```typescript
+--- a/lib/actions/payment.ts
++++ b/lib/actions/payment.ts
+@@ -1,5 +1,5 @@
+ "use server";
+-import { PaymentStatus } from "@prisma/client";
++import { PaymentStatus, PaymentDirection } from "@prisma/client";
+ import { prisma } from "@/lib/database";
+ import { auth } from "@/lib/auth/server";
+ import { headers } from "next/headers";
+@@ -20,7 +20,11 @@
+   const payments = await prisma.payment.findMany({
+     where: {
+       // This function specifically fetches payments ready for the banking dashboard
+-      status: PaymentStatus.APPROVED,
++      AND: [
++        { status: PaymentStatus.APPROVED },
++        { direction: PaymentDirection.OUTGOING },
++        { bankingSnapshot: { not: null } },
++      ],
+     },
+     include: {
+       caseAllocations: {
+```
 
 ## Test Suggestions
 
 Framework: `Vitest`
 
-- **shouldOnlyReturnPaymentsWithBankingSnapshot** — Verifies that the data fetching for the Banking Dashboard correctly filters out records that are missing the required banking snapshot, ensuring data integrity on the UI.
-- **shouldReturnErrorWhenApprovingRefundForRecipientWithMissingAchInfo** — This is the primary regression test for the bug. It ensures the new server-side validation prevents a refund from being approved if the recipient's banking information is incomplete.
-- **shouldSuccessfullyApproveRefundWhenRecipientHasCompleteAchInfo** — This happy path test ensures that the approval process works as expected when all validation conditions are met.
-- **shouldDisplayErrorToastWhenApprovalFails** — Verifies that the UI provides clear, immediate feedback to the user when a refund approval fails on the server due to the new validation logic.
-- **shouldDisplaySuccessToastWhenApprovalSucceeds** — Verifies the happy path for the UI, ensuring the user receives positive feedback when an approval is processed successfully.
+- **shouldThrowErrorWhenApprovingAchRefundForRecipientWithMissingBankingInfo** — This is the primary test case to validate the new server-side validation logic. It ensures that the approval process is halted at the source if the necessary banking data is not present, directly addressing the bug.
+- **shouldSuccessfullyApproveAchRefundWhenRecipientHasBankingInfo** — This happy path test ensures that the new validation logic does not block valid ACH refund approvals, preventing a regression for the standard workflow.
+- **shouldDisplayErrorToastWhenApprovalFailsDueToMissingBankingInfo** — This component test verifies that the UI correctly handles the new error case from the server action and provides clear feedback to the user, as specified in the implementation plan.
+- **shouldFilterOutApprovedPaymentsMissingBankingSnapshot** — This test validates the defensive filtering added to the banking dashboard's data query. It ensures that any records that may have slipped through validation previously (or in the future) are hidden from the user, preventing confusion and cleaning up the UI as intended.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the official end-to-end case lifecycle, which the ticket (IDRE-558) indicates is not being followed correctly for refunds. The developer needs to understand the intended process flow that their new validation logic will enforce.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document explicitly identifies the 'Payments & Refunds Logic / Workflow' as a 'major complexity hotspot' prone to errors in status transitions. This validates the ticket's premise and alerts the developer to the fragility of this module. The QA suggestions directly relate to the acceptance criteria.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the canonical end-to-end case lifecycle, including status transitions. The ticket addresses a failure in this workflow, specifically the transition of a refund to the banking dashboard. This document provides the high-level business process that the developer's code must correctly implement.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document identifies 'Payments & Refunds Logic / Workflow' as a primary source of critical bugs and a 'major complexity hotspot.' It gives the developer essential context that the area they are working in is fragile and requires careful implementation and testing, validating the importance of the ticket's goal to harden the validation logic.
 
 **Suggested Documentation Updates:**
 
-- IDRE Worflow: This document should be updated to explicitly include the three-step validation process (Paid dispute, Attached banking info, Approved status) required before a refund can be moved to the Banking Dashboard for NACHA processing.
+- IDRE Worflow
 
 ## AI Confidence Scores
-Plan: 90%, Code: 95%, Tests: 95%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

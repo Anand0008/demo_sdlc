@@ -3,168 +3,74 @@
 **Jira Ticket:** [IDRE-623](https://orchidsoftware.atlassian.net//browse/IDRE-623)
 
 ## Summary
-This plan addresses a bug where the organization filter on the "Pay Online" page is not working correctly. The fix involves updating the backend server action in `lib/party-actions.ts` to properly use the provided `organizationId` in its database query to filter cases. A corresponding check in `app/app/payments/page.tsx` will ensure the selected organization ID from the UI is passed to this updated backend function.
+The current organization filter on the "Pay Online" page operates client-side, leading to incorrect case lists. The plan is to modify the filter's `onValueChange` handler in `app/app/payments/components/payment-form.tsx`. Instead of just updating local state, the new handler will use Next.js's `useRouter` to update the `organizationId` in the URL's query parameters. This will trigger a server-side data refetch via the page component (`app/app/payments/page.tsx`), which already uses this parameter to correctly filter cases via the `getCasesForPayment` action. This ensures the displayed cases accurately reflect the selected organization.
 
 ## Implementation Plan
 
-**Step 1: Update server action to filter cases by organization ID**  
-Locate the `getPartyCases` function (or the function aliased as `getCasesForPayment` used by the payments page). Modify its signature to accept an optional `organizationId` string parameter. Inside the function, update the `prisma.case.findMany` query. If a valid `organizationId` is provided (i.e., not null or 'all'), add a condition to the main `where` clause to filter the results. The condition should ensure that only cases where either the `initiatingPartyOrganizationId` or `nonInitiatingPartyOrganizationId` matches the provided `organizationId` are returned.
-Files: `lib/party-actions.ts`
+**Step 1: Update Organization Filter to Trigger Server-Side Refetch**  
+In the `PaymentForm` component, create a new handler function `handleOrganizationChange`. This function will take the selected organization ID as an argument. Inside this function, use the `useRouter` hook (already available as `router`) to update the URL's `organizationId` search parameter. If the selected value is "all", remove the `organizationId` parameter; otherwise, set it. This will trigger a server-side refetch of the cases, filtered by the selected organization. Then, update the `onValueChange` prop of the organization filter `Select` component (around line 1400) to use this new handler instead of `setOrganizationFilter`.
+Files: `app/app/payments/components/payment-form.tsx`
 
-**Step 2: Ensure organization ID is passed from page to server action**  
-In the `PaymentsPage` component, locate the call to the case-fetching server action (`getPartyCases` or `getCasesForPayment`). Ensure that the `activeOrganizationId` variable, which is derived from the `organizationId` search parameter, is correctly passed to the server action. This will connect the frontend filter selection to the updated backend logic.
-Files: `app/app/payments/page.tsx`
-
-**Risk Level:** LOW — The change is confined to a single data-fetching function and its corresponding call on the page. The modification adds a filter condition, which is unlikely to have unintended side effects on other parts of the application. The risk of regression is low as it corrects a specific filtering bug.
+**Risk Level:** LOW — The change is confined to a single client component and modifies UI behavior to align with existing server-side data fetching logic. The backend action already supports the required filtering, so no backend changes are needed. The risk of unintended side effects is low as the change is targeted at the filtering mechanism itself.
 
 ## Proposed Code Changes
 
-### `lib/party-actions.ts` (modify)
-The core of the bug lies here. The `getCasesForPayment` function, which fetches cases for the payments page, was not considering the `organizationId`. I've updated its signature to accept an `organizationId` and added logic to conditionally modify the Prisma query. If an `organizationId` is provided, it now filters cases where the organization is either the initiating or non-initiating party. I also updated the `fetchMoreCasesForPayment` wrapper to accept and pass through the `organizationId`, ensuring pagination also respects the filter.
-```typescript
---- a/lib/party-actions.ts
-+++ b/lib/party-actions.ts
-@@ -1,12 +1,14 @@
- "use server";
- 
- import { revalidatePath } from "next/cache";
- import { z } from "zod";
- import { prisma } from "@/lib/prisma";
- import { getCurrentSession } from "@/lib/auth/utils";
- import { Prisma } from "@prisma/client";
- 
- export async function getCasesForPayment({
-   page = 1,
-   limit = 25,
-+  organizationId,
- }: {
-   page?: number;
-   limit?: number;
-+  organizationId?: string | null;
- }) {
-   const session = await getCurrentSession();
-   if (!session?.user?.partyId) {
-@@ -22,6 +24,19 @@
-     ],
-   };
- 
-+  if (organizationId) {
-+    where.AND = [
-+      ...(Array.isArray(where.AND) ? where.AND : []),
-+      {
-+        OR: [
-+          { initiatingPartyOrganizationId: organizationId },
-+          { nonInitiatingPartyOrganizationId: organizationId },
-+        ],
-+      },
-+    ];
-+  }
-+
-   try {
-     const [cases, total] = await prisma.$transaction([
-       prisma.case.findMany({
-@@ -51,10 +66,16 @@
- 
- export async function fetchMoreCasesForPayment({
-   page = 1,
-   limit = 25,
-+  organizationId,
- }: {
-   page?: number;
-   limit?: number;
-+  organizationId?: string | null;
- }) {
--  return getCasesForPayment({ page, limit });
-+  return getCasesForPayment({ page, limit, organizationId });
- }
- 
- export async function downloadCasesForPaymentCsv() {
-```
-
-### `app/app/payments/page.tsx` (modify)
-This change connects the frontend filter selection to the updated backend logic for the initial page load. The `activeOrganizationId`, derived from the URL search parameters, is now passed to the `getCasesForPayment` server action.
-```
---- a/app/app/payments/page.tsx
-+++ b/app/app/payments/page.tsx
-@@ -58,7 +58,7 @@
-   // Using paginated fetch to avoid Lambda timeout for large organizations.
-   const [initialCasesResult, bankAccounts] = await Promise.all([
--    getCasesForPayment({ page: 1 }),
-+    getCasesForPayment({ page: 1, organizationId: activeOrganizationId }),
-     getUserBankAccounts(),
-   ]);
-```
-
 ### `app/app/payments/components/payment-form.tsx` (modify)
-To ensure the organization filter persists during pagination, this change is necessary. I've added the `useSearchParams` hook to get the current `organizationId` from the URL and pass it to the `fetchMoreCasesForPayment` action when loading more cases. This prevents the filter from being dropped after the first page.
+The previous implementation used `setOrganizationFilter` for the `onValueChange` handler, which only updated local state and performed client-side filtering on a potentially incomplete list of cases. This led to incorrect results.
 ```
 --- a/app/app/payments/components/payment-form.tsx
 +++ b/app/app/payments/components/payment-form.tsx
-@@ -1,6 +1,6 @@
- "use client";
+@@ -289,6 +289,16 @@
+   const [showBankAccountRequiredDialog, setShowBankAccountRequiredDialog] =
+     useState(false);
  
- import { useState, useCallback, useEffect, useMemo, useRef } from "react";
--import { useRouter } from "next/navigation";
-+import { useRouter, useSearchParams } from "next/navigation";
- import { useForm } from "react-hook-form";
- import { zodResolver } from "@hookform/resolvers/zod";
- import { z } from "zod";
-@@ -73,6 +73,7 @@
-   const [isSubmitting, setIsSubmitting] = useState(false);
-   const [isLoadingMore, setIsLoadingMore] = useState(false);
-   const router = useRouter();
-+  const searchParams = useSearchParams();
-   const form = useForm<z.infer<typeof paymentFormSchema>>({
-     resolver: zodResolver(paymentFormSchema),
-     defaultValues: {
-@@ -210,10 +211,11 @@
-     if (!hasMorePages || isLoadingMore) return;
-     setIsLoadingMore(true);
-     try {
-+      const organizationId = searchParams.get("organizationId");
-       const nextPage = currentPage + 1;
-       const result = await fetchMoreCasesForPayment({
-         page: nextPage,
--        limit: 25, // Assuming a page size
-+        organizationId,
-       });
- 
-       if (result.error) {
-@@ -227,7 +229,7 @@
-     } finally {
-       setIsLoadingMore(false);
-     }
--  }, [currentPage, hasMorePages, isLoadingMore, cases, setCases]);
-+  }, [currentPage, hasMorePages, isLoadingMore, cases, setCases, searchParams]);
- 
-   const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) => {
-     const value = e.target.value;
++  const handleOrganizationChange = (organizationId: string) => {
++    // Instead of client-side filtering, update the URL to trigger a server-side
++    // refetch of cases for the selected organization.
++    if (organizationId === "all") {
++      router.push('/app/payments');
++    } else {
++      router.push(`/app/payments?organizationId=${organizationId}`);
++    }
++  };
++
+   const visibleCases = useMemo(() => {
+     if (optimisticallyHiddenCaseIds.length === 0) {
+       return cases;
+@@ -1399,7 +1409,7 @@
+                       {organizationFilterOptions.length > 0 && (
+                         <Select
+                           value={organizationFilter}
+-                          onValueChange={setOrganizationFilter}
++                          onValueChange={handleOrganizationChange}
+                         >
+                           <SelectTrigger className="h-9 w-full text-sm sm:max-w-[220px] lg:max-w-[240px] xl:max-w-[260px]">
+                             <SelectValue placeholder="Filter organizations" />
 ```
 
 **New Dependencies:**
-- `None`
+- `_No new dependencies needed._`
 
 ## Test Suggestions
 
-Framework: `Jest/Vitest`
+Framework: `Vitest`
 
-- **shouldFilterCasesByOrganizationIdWhenProvided** — This is a regression test for the bug fix. It verifies that when an `organizationId` is provided, the server action correctly builds the database query to filter cases belonging to that organization.
-- **shouldPassOrganizationIdToFetchMoreCasesWhenPaginating** — This test ensures the client-side component correctly reads the organization filter from the URL and passes it to the server action during pagination, preventing the filter from being dropped after the first page.
-- **shouldNotAddFilterWhenOrganizationIdIsMissing** *(edge case)* — This test covers the edge case where no organization filter is applied. It ensures that the function's behavior remains correct for the default, unfiltered view, preventing a regression.
-- **shouldPassOrganizationIdToGetCasesForPaymentOnInitialLoad** — This test verifies that the initial page load correctly uses the organization filter from the URL. It ensures the first set of data displayed to the user is already filtered.
+- **shouldUpdateUrlWhenOrganizationIsSelected** — Verifies that selecting an organization in the filter dropdown triggers a URL update with the correct organizationId query parameter.
+- **shouldRemoveOrganizationIdFromUrlWhenFilterIsCleared** — Ensures that when the user clears the filter, the organizationId query parameter is removed from the URL, triggering a refetch for all cases.
+- **shouldSetInitialFilterValueFromUrlParameter** — Verifies that the component correctly initializes its state from the URL query parameters on initial render, ensuring the filter reflects the current page state.
 
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document (PRD) for the exact feature the ticket is addressing. It is the primary source of truth for business rules and expected behavior of the organization management system, including how filtering should function. A developer must read this to understand the intended logic before attempting a fix.
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This release overview explains the functionality of the Organization Management tools. It provides context on the user-facing aspects of the feature, such as the relationship between users, organizations, and cases, which is directly relevant to fixing a data visibility bug in the filter.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This PRD is the most critical document. It defines the business rules and data model for the Organization Management system, which is at the core of the ticket. It details the two-level parent/sub-organization hierarchy and states that users can be associated with multiple organizations, which is essential context for debugging the filter logic.
+- [IDRE Platform Weekly Work Summary: April 8, 2026 Updates and Enhancements](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/318275601) — This weekly summary provides important context by listing recently worked-on tickets related to the Organization Management tool. Specifically, it mentions IDRE-705 "Party Portal: Not able to see all organizations in filter dropdown", which is very similar to the bug in IDRE-623. This indicates that the feature is under active development and may have related complexities.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document provides high-level context about recurring bug themes. It explicitly calls out the "Party Portal & User Experience / Permissions" and "Organization & User Data Integrity" as fragile areas. This confirms that bugs related to what users can see based on their organization are a known category of issues, which is helpful for the developer to understand the problem's context.
 
 **Suggested Documentation Updates:**
 
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This document should be reviewed to ensure the filtering logic implemented in the bug fix aligns with the specified requirements. If any ambiguity in the requirements led to the bug, the document should be clarified.
-- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: As this is a user-facing overview, it should be checked for accuracy after the bug is fixed to ensure it correctly describes the filtering behavior.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: The document should be updated to explicitly define the expected filter behavior regarding the parent/sub-organization hierarchy. For example, it should clarify whether selecting a parent organization in a filter should also return results for all its sub-organizations.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 85%, Tests: 90%
+Plan: 100%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

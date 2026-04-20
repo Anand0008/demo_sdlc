@@ -3,99 +3,43 @@
 **Jira Ticket:** [IDRE-559](https://orchidsoftware.atlassian.net//browse/IDRE-559)
 
 ## Summary
-This plan addresses a UI rendering error on the payments page that occurs when submitting an ACH payment with a large number of cases. The fix involves modifying the `processBulkPayment` server action in `lib/party-actions.ts` to return a minimal success message instead of a large data payload. The client component, `app/app/payments/components/payment-form.tsx`, will be updated to handle this new response by showing a success toast and then triggering a server-side data refresh, which resolves the rendering issue.
+This plan resolves a server component rendering error on the payments page by optimizing the `getCasesForPayment` server action. The error is caused by an overly large data payload for users with many organizations. The fix involves removing unused `id` and `email` fields from the `initiatingParty` and `nonInitiatingParty` relations within the main Prisma query in `lib/actions/party-payments.ts`. This will reduce the response size and prevent the rendering failure without affecting component logic.
 
 ## Implementation Plan
 
-**Step 1: Modify `processBulkPayment` Server Action to Return Minimal Response**  
-Locate the `processBulkPayment` server action. Modify the function's return statement to prevent it from sending a large payload (like the full list of updated cases) back to the client. Instead, upon successful processing, it should return a minimal, serializable object containing only a success flag and perhaps a batch identifier. For example: `return { success: true, data: { message: "Payment processing started." } };`
-Files: `lib/party-actions.ts`
+**Step 1: Optimize party data fetching in `getCasesForPayment`**  
+In the `getCasesForPayment` function, locate the `prisma.case.findMany` call. Within the `include` option for this call, modify the `select` clauses for the `initiatingParty` and `nonInitiatingParty` relations. Remove the `id: true` and `email: true` fields from both of these `select` clauses. These fields are currently being fetched but are not utilized by the downstream components, and their removal will decrease the data payload size. This change should be made around lines 377-392.
+Files: `lib/actions/party-payments.ts`
 
-**Step 2: Update Payment Form to Handle New Action Response and Refresh**  
-In the form submission handler that calls `processBulkPayment`, update the logic that processes the returned result. Instead of expecting a large data object to update the component's state, the logic should now handle the new minimal success object. On success, display a toast notification to the user and then call `router.refresh()` to reload the page's data from the server. This ensures the UI reflects the new payment status without causing a rendering error from a large data payload. The `useRouter` hook is already imported in this component.
-Files: `app/app/payments/components/payment-form.tsx`
-
-**Risk Level:** LOW — The issue is confined to the staging environment and a specific user flow. The proposed change is minimal, targeting only the data transfer between a server action and a client component, and uses a standard pattern (action followed by router refresh) to resolve the issue, which has a low risk of side effects.
+**Risk Level:** LOW — The change is confined to a single server action and only removes unused fields from a database query. This reduces the data payload without altering any logic, making the risk of unintended side effects very low. The fix directly addresses the "huge response" issue mentioned in the ticket.
 
 ## Proposed Code Changes
 
-### `lib/party-actions.ts` (modify)
-The `processBulkPayment` server action was re-fetching all cases and returning them to the client. This large data payload was causing the client-side component to crash. This change removes the unnecessary data fetching and returns a simple success message, which is much smaller and avoids the rendering issue. The client will be responsible for refreshing its data.
+### `lib/actions/party-payments.ts` (modify)
+The `id` and `email` fields for the initiating and non-initiating parties were being fetched but are not used by the downstream components on the payments page. Removing them significantly reduces the size of the data payload sent to the client, which resolves the component rendering error experienced by users with access to a large number of cases and organizations. The `name` and `userId` fields, which are used, are preserved.
 ```typescript
---- a/lib/party-actions.ts
-+++ b/lib/party-actions.ts
-@@ -249,30 +249,12 @@
-     // The client will handle UI updates via router.refresh().
-   }
- 
--  // Re-fetch cases to update the UI
--  const { data: partyUser } = await getPartyUserFromSession();
--  if (!partyUser) {
--    return { success: false, error: "User not found." };
--  }
--
--  const updatedCasesResult = await getCasesForPayment({
--    partyUserId: partyUser.id,
--    organizationId: activeOrganizationId,
--    page: 1,
--    pageSize: 20, // Default page size
--    partyType: partyType || undefined,
--  });
--
--  if (!updatedCasesResult.success) {
--    return {
--      success: false,
--      error: "Could not retrieve updated cases after payment.",
--    };
--  }
--
-   return {
-     success: true,
--    data: {
--      cases: updatedCasesResult.data.cases,
--      totalCases: updatedCasesResult.data.totalCases,
--      totalPages: updatedCasesResult.data.totalPages,
--    },
-+    data: {
-+      message:
-+        "Payment processing has been initiated. The list will update shortly.",
-+    },
-   };
- }
-```
-
-### `app/app/payments/components/payment-form.tsx` (modify)
-This change updates the form submission handler to correctly process the new, minimal response from the `processBulkPayment` action. Instead of attempting to update local state with a large data payload (which is no longer sent), it now displays a success toast and calls `router.refresh()`. This triggers a fresh data fetch from the server, updating the UI safely and efficiently without causing the rendering crash.
-```
---- a/app/app/payments/components/payment-form.tsx
-+++ b/app/app/payments/components/payment-form.tsx
-@@ -581,18 +581,17 @@
-     setIsSubmitting(false);
- 
-     if (result.success) {
--      toast.success("Payment successful!");
--      // Update local state with the new data from the server action
--      setCases(result.data.cases);
--      setTotalCases(result.data.totalCases);
--      setPagination(prev => ({
--        ...prev,
--        totalPages: result.data.totalPages,
--        currentPage: 1,
--      }));
-+      toast.success(
-+        result.data.message ||
-+          "Payment processing initiated. The page will now refresh."
-+      );
-+
-+      // Instead of updating local state with a large payload,
-+      // trigger a server-side refresh of the page data.
-+      // This avoids the component rendering error from the large response.
-+      router.refresh();
-+
-       // Reset form state after submission
-       form.reset({ ...values, selectedCases: [] });
-       setSelectedRows({});
-       setSelectAll(false);
+--- a/lib/actions/party-payments.ts
++++ b/lib/actions/party-payments.ts
+@@ -377,20 +377,16 @@
+       include: {
+         initiatingParty: {
+           select: {
+-            id: true,
+             name: true,
+-            email: true,
+             userId: true,
+           },
+         },
+         nonInitiatingParty: {
+           select: {
+-            id: true,
+             name: true,
+-            email: true,
+             userId: true,
+           },
+         },
+         initiatingPartyOrganization: {
+           select: {
 ```
 
 **New Dependencies:**
@@ -105,22 +49,23 @@ This change updates the form submission handler to correctly process the new, mi
 
 Framework: `Vitest`
 
-- **shouldShowSuccessToastAndRefreshOnSuccessfulPayment** — Verifies the new success flow where the component handles a minimal success response, shows a toast, and triggers a client-side refresh instead of processing a large data payload.
-- **shouldShowErrorToastWhenPaymentFails** *(edge case)* — Ensures that if the server action fails, the user is shown an error message and the page does not attempt to refresh, allowing the user to try again.
-- **shouldDisableSubmitButtonWhileProcessingPayment** — Verifies the UI provides feedback to the user and prevents duplicate submissions while the payment is being processed.
+- **shouldReturnCasesWithoutUnusedPartyFields** — This test verifies that the `getCasesForPayment` function correctly removes the unused `id` and `email` fields from the party details to reduce the payload size, while retaining the fields that are required by the UI. This is the core validation for the bug fix.
+- **shouldReturnEmptyArrayWhenUserHasNoCases** *(edge case)* — This test covers the edge case where a user has no cases to pay for, ensuring the function handles it gracefully without errors.
 
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — The ticket describes a bug that occurs when a user selects a specific organization to add bank details for payment. This PRD outlines the business rules and expected functionality for the Organization Management System, providing essential context for how this feature should work.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document identifies that the payments, refunds, and banking modules are known "complexity hotspots" and a common source of bugs. This is critical operational context for a developer fixing a payment-related issue, as it highlights the need for careful implementation and thorough regression testing.
+- [IDRE Platform Weekly Work Summary: April 8, 2026 Updates and Enhancements](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/318275601) — This weekly summary lists two tickets that are almost identical to IDRE-559: "IDRE-704: After adding new bank account, not able to pay for a dispute" and "IDRE-706: Party Portal: Toaster error when paying pending payment disputes". This indicates a recurring issue in this area of the application that a developer should be aware of.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This PRD establishes the core business rule that a payment cannot be initiated without a verified banking account explicitly bound to an organization. It also details the data model, including the 'banking_verified' flag on the Organization table, which is central to the functionality described in the ticket.
+- [Week 16](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/325582850) — This page explicitly calls out the history of a nearly identical bug, IDRE-704 ("After adding new bank account to organization not able to pay for a dispute"), noting it required "Multiple QA cycles and a reassignment before landing". This highlights that the feature is complex and has a history of difficult-to-fix bugs.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document provides critical context about systemic issues. It identifies "Banking & Banking Dashboard Issues" and "Party Portal & User Experience" as major pain points, describing the system as "fragile," especially for users with multiple organizations. This directly relates to the ticket's description of a user selecting a specific organization and getting an error.
 
 **Suggested Documentation Updates:**
 
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This document should be reviewed after the fix is implemented to ensure it accurately reflects any changes to the component's behavior, especially if new constraints or handling for large data responses are introduced.
-- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: This document should be updated to include a specific test case for payment flows involving organizations with a large number of associated entities to prevent future performance regressions.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: The document should be updated if any business rules regarding bank account verification or organization hierarchy are modified to resolve the bug.
+- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: A specific test case should be added to the 'Unhappy Paths' for the Payment & Party Portal section to cover this failure scenario (user with many organizations adding a new bank account) to prevent regressions.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 90%, Tests: 90%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

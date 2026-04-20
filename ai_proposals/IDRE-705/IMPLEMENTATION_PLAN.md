@@ -3,99 +3,100 @@
 **Jira Ticket:** [IDRE-705](https://orchidsoftware.atlassian.net//browse/IDRE-705)
 
 ## Summary
-This plan addresses the missing "All Organizations" filter option on the Party Portal's cases page. First, the `getPartyCases` server action in `lib/party-actions.ts` will be updated to fetch and return all organizations the current user is a member of. Second, the frontend component `app/app/cases/components/cases-page-client.tsx` will be modified to use this list to populate the organization filter, ensuring a static "All Organizations" option is always included at the top of the dropdown.
+This implementation plan addresses the missing "All Organizations" filter option by replacing the `<OrganizationSwitcher>` component in `app/app/cases/components/cases-page-client.tsx` with a standard `<Select>` dropdown. This new dropdown will be explicitly populated with an "All Organizations" option, ensuring it is always visible to the user, consistent with other parts of the application.
 
 ## Implementation Plan
 
-**Step 1: Enhance `getPartyCases` to Return User's Organizations**  
-Modify the `getPartyCases` server action to fetch and return a list of all organizations associated with the currently authenticated user. This will involve querying the `Member` and `Organization` models to build a list of organizations (with their ID and name) that the user belongs to. This list will be added to the return object of the function so the frontend can populate the filter dropdown.
-Files: `lib/party-actions.ts`
-
-**Step 2: Update Cases Page Client to Add "All Organizations" Filter Option**  
-Update the client component for the cases page to correctly render the "Filter by Organization" dropdown. The component will now receive the list of organizations from the `getPartyCases` action. The implementation should prepend a static "All Organizations" option to the top of the list received from the backend. Selecting this option should result in filtering for all cases accessible to the user, likely by passing a null or undefined organization ID to the `getPartyCases` action on subsequent data fetches.
+**Step 1: Replace `OrganizationSwitcher` with a standard `Select` component**  
+In the `CasesPageClient` component, replace the existing `<OrganizationSwitcher>` component with a standard `<Select>` component. This change provides direct control over the dropdown's options. The new `<Select>` component will be explicitly populated with a static "All Organizations" option, followed by the list of organizations passed in via props. The `onValueChange` handler will be adjusted to pass `null` to the `handleOrganizationChange` function when "All Organizations" is selected, which aligns with the existing logic for fetching data for all organizations.
 Files: `app/app/cases/components/cases-page-client.tsx`
 
-**Risk Level:** LOW — The change is confined to a single filter component and its backing server action. It's an additive UI change that improves filtering capability and is unlikely to affect other parts of the application. The risk of regression is minimal.
+**Risk Level:** LOW — The change is isolated to a single client-side component and replaces an abstraction with a concrete, known-working pattern from elsewhere in the codebase. The backend already supports the "All Organizations" functionality, so no data-layer changes are needed. The risk is low as the change is straightforward and easily testable.
 
 ## Proposed Code Changes
 
-### `lib/party-actions.ts` (modify)
-As per the implementation plan, this change modifies the `getPartyCases` server action. It now queries for all organizations the current user is a member of and includes this list in the returned data. This provides the necessary information for the frontend to populate the organization filter dropdown. The function's return type has also been updated to reflect this new data.
-```typescript
---- a/lib/party-actions.ts
-+++ b/lib/party-actions.ts
-@@ -108,7 +108,7 @@
-   search?: string;
- }): Promise<
-   ActionResult<{
-     cases: SerializedCase[];
-     totalPages: number;
-+    organizations: { id: string; name: string }[];
-   }>
- > {
-   try {
-@@ -118,6 +118,23 @@
-     }
-     const userId = session.user.id;
- 
-+    const userOrganizations = await prisma.organization.findMany({
-+      where: {
-+        members: {
-+          some: {
-+            userId: userId,
-+          },
-+        },
-+      },
-+      select: {
-+        id: true,
-+        name: true,
-+      },
-+      orderBy: {
-+        name: "asc",
-+      },
-+    });
-+
-     const memberships = await prisma.member.findMany({
-       where: { userId },
-       select: { organizationId: true },
-@@ -211,6 +228,7 @@
-       data: {
-         cases: serializedCases,
-         totalPages,
-+        organizations: userOrganizations,
-       },
-     };
-   } catch (error) {
+### `app/app/cases/components/cases-page-client.tsx` (modify)
+The `OrganizationSwitcher` component was not displaying the "All Organizations" option as required on the cases page. This change replaces it with a standard `Select` component from the UI library, which provides direct control over the dropdown's options. An "All Organizations" `SelectItem` is explicitly added to ensure it is always present. The `onValueChange` handler is configured to pass `null` to the existing `handleOrganizationChange` function when "All Organizations" is selected, which aligns with the backend logic for fetching data across all organizations.
+```
+--- a/app/app/cases/components/cases-page-client.tsx
++++ b/app/app/cases/components/cases-page-client.tsx
+@@ -5,7 +5,14 @@
+ import { getPartyCases } from "@/lib/actions";
+ import { CasesTable } from "./cases-table";
+ import { PaginationControls } from "@/components/shared/pagination-controls";
+-import { OrganizationSwitcher } from "@/components/party/banking/organization-switcher";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
+ import { CaseStatusFilter } from "./case-status-filter";
+ import { CasePartyTypeFilter } from "./case-party-type-filter";
+ import { useDebounce } from "@/lib/hooks/use-debounce";
+@@ -103,12 +110,28 @@
+   return (
+     <div className="space-y-6">
+       <div className="flex items-center space-x-4">
+-        <OrganizationSwitcher
+-          organizations={organizations}
+-          selectedOrganizationId={currentOrganizationId}
+-          onSelect={handleOrganizationChange}
+-          showAllOrganizations
+-        />
++        <div className="flex flex-col gap-1">
++          <span className="text-xs font-medium uppercase text-muted-foreground">
++            Filter by Organization
++          </span>
++          <Select
++            value={currentOrganizationId ?? "all"}
++            onValueChange={(value) => {
++              handleOrganizationChange(value === "all" ? null : value);
++            }}
++          >
++            <SelectTrigger className="w-80 justify-between">
++              <SelectValue placeholder="Select an organization" />
++            </SelectTrigger>
++            <SelectContent>
++              <SelectItem value="all">All Organizations</SelectItem>
++              {organizations.map((org) => (
++                <SelectItem key={org.id} value={org.id}>
++                  {org.name}
++                </SelectItem>
++              ))}
++            </SelectContent>
++          </Select>
++        </div>
+         <CaseStatusFilter
+           currentStatus={currentStatu
+... (truncated — see full diff in files)
 ```
 
-### `app/app/cases/components/cases-page-client.tsx` (modify)
-No rationale provided
-```
-cases: Case[];
-totalPages: number;
-```
+**New Dependencies:**
+- `No new dependencies needed.`
 
 ## Test Suggestions
 
 Framework: `Vitest`
 
-- **shouldRenderOrganizationFilterWithAllOrganizationsOption** — Verifies that the organization filter dropdown renders correctly, including the static "All Organizations" option and the dynamic list of organizations fetched from the server action.
-- **shouldRenderOnlyAllOrganizationsOptionWhenUserHasNoOrganizations** *(edge case)* — Ensures the dropdown handles the case where a user is not a member of any organization, showing only the default "All Organizations" option.
-- **shouldUpdateUrlSearchParamsWhenOrganizationIsSelected** — Verifies that selecting an organization from the dropdown triggers a navigation or data refetch with the appropriate filter applied.
-- **shouldReturnCasesAndOrganizationsForUser** — Verifies that the updated server action successfully fetches and returns both cases and the list of organizations a user is a member of.
+- **shouldRenderTheSelectDropdownWithAllOrganizationsAndGivenOrganizations** — Verifies that the new Select component correctly renders the default "All Organizations" option and dynamically populates the rest of the options from the organizations prop.
+- **shouldCallHandleOrganizationChangeWithNullWhenAllOrganizationsIsSelected** — This test ensures that selecting "All Organizations" correctly triggers the event handler with a null value, which is the expected behavior for fetching data for all organizations.
+- **shouldCallHandleOrganizationChangeWithTheCorrectIdWhenAnOrganizationIsSelected** — This test validates that selecting a specific organization triggers the event handler with the correct organization ID, preserving the existing filtering logic.
+- **shouldRenderOnlyTheAllOrganizationsOptionWhenOrganizationsPropIsEmpty** *(edge case)* — This edge case test ensures the component behaves gracefully and remains functional even when there are no organizations to display, which could happen for new users or certain account types.
 
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document (PRD) for the feature mentioned in the ticket. It should contain the definitive business rules and acceptance criteria for how the organization filter is designed to function, including whether an "All Organizations" option is required.
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This release overview describes the functionality of the Organization Management tools from a user's perspective. It likely contains screenshots and descriptions of the intended UI, which can serve as a reference for the developer to confirm the expected behavior of the filter dropdown.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This PRD is the primary source of truth for the Organization Management system. It defines the strict two-level parent/child data model, user-to-organization association rules, and technical implementation details for the organization hierarchy. This context is essential for a developer to correctly implement a filter that includes an 'All Organizations' view, as it dictates what data should be aggregated for a given user.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This release overview describes the implemented features for Organization Management, including the master 'Organizations' tab and its filtering capabilities. It provides context on how organization data, including parent-sub relationships and types (Provider, Aggregator), is presented in the UI. This is relevant for ensuring the 'Filter by Organization' dropdown in the Party Portal is consistent with existing patterns.
 
 **Suggested Documentation Updates:**
 
-- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview - To be updated with new screenshots and documentation reflecting the corrected filter functionality.
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System - To be reviewed to ensure the requirement for an "All Organizations" option is explicitly stated to prevent future regressions.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: The 'Search & Selection UX' section could be updated to explicitly mention the 'All Organizations' filter option in the Party Portal to ensure requirements are fully captured.
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: This document should be updated to reflect the corrected functionality of the 'Filter By Organization' dropdown in the Party Portal once the fix for IDRE-705 is deployed.
 
 ## AI Confidence Scores
-Plan: 90%, Code: 90%, Tests: 90%
+Plan: 90%, Code: 90%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

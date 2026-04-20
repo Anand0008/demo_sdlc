@@ -3,329 +3,211 @@
 **Jira Ticket:** [IDRE-643](https://orchidsoftware.atlassian.net//browse/IDRE-643)
 
 ## Summary
-This plan outlines the creation of a feature to merge two organizations. The implementation includes a new server action in `lib/actions/organization.ts` to handle the database updates within a transaction, a new warning modal component as specified in the ticket to ensure user awareness of the irreversible action, and UI modifications to the company management page (`app/dashboard/company/page.tsx`) to trigger the process. A final verification step ensures that financial reporting, particularly the case ledger, remains accurate after a merge.
+This plan refines the "Combine Organizations" feature by introducing a mandatory warning and confirmation modal before executing the merge. A new server action will be created to fetch organization details, including member emails, to check for potential primary email mismatches as required by the ticket. The frontend component will be updated to call this new action, display the warning in an `AlertDialog`, and only proceed with the merge upon explicit user confirmation, thereby preventing accidental data loss.
 
 ## Implementation Plan
 
-**Step 1: Create `mergeOrganizations` Server Action**  
-Create a new server action `mergeOrganizations(sourceOrgId: string, targetOrgId:string)`. This action must use a Prisma transaction (`prisma.$transaction`) to atomically perform the following: 1. Identify all models with a foreign key to the `Organization` model by inspecting `prisma/schema.prisma`. This includes, but is not limited to, `CaseParty`, `Invoice`, `Payment`, `User`, and `BankAccount`. 2. Update all records in these related tables, changing their `organizationId` from `sourceOrgId` to `targetOrgId`. 3. After all related records are successfully re-associated, delete the source organization record (`prisma.organization.delete`). 4. Ensure the action is protected and can only be executed by users with appropriate administrative roles.
-Files: `lib/actions/organization.ts`, `prisma/schema.prisma`
+**Step 1: Create Server Action to Fetch Organization Details for Merge Confirmation**  
+Create a new server action `getOrganizationMergeDetails` to fetch the necessary information for the warning modal. This action will retrieve the names of the two organizations, the primary email of the target organization, and a list of all member emails from the source organization. The primary email will be sourced from the `email` field on the `Organization` model. Member emails will be retrieved by joining through the `Member` and `User` models. This action requires organization management permissions.
+Files: `lib/actions/admin.ts`
 
-**Step 2: Create Merge Organization Warning Modal**  
-Create a new file and component for the warning modal. This component will accept the source and target organization objects as props. It will display the specific warning text from the ticket description. The component will be responsible for comparing the organizations' primary emails/domains and conditionally rendering the "Security & Data Mismatch" warning. The 'Confirm Merge' button within the modal will invoke the `mergeOrganizations` server action. To prevent accidental execution, the confirm button should be disabled until the user types a confirmation word (e.g., "MERGE") into a text field.
-Files: `components/company/merge-organization-warning-modal.tsx`
+**Step 2: Integrate Confirmation Dialog Trigger and Data Fetching**  
+Introduce a new state to manage an `AlertDialog` for merge confirmation. The existing "Combine Organizations" form submission will be modified to call the new `getOrganizationMergeDetails` server action instead of directly performing the merge. The data returned will be used to populate and display the confirmation dialog. Add a loading state for this data-fetching step.
+Files: `components/organizations-management.tsx`
 
-**Step 3: Add Merge UI to Company Management Page**  
-Modify the company management page to allow an administrator to select two organizations to be merged. This will likely involve adding checkboxes to the list of organizations and a 'Merge Selected' button. When clicked, this button will open the `MergeOrganizationWarningModal` and pass the data for the two selected organizations.
-Files: `app/dashboard/company/page.tsx`
+**Step 3: Implement the Merge Confirmation Warning Modal UI**  
+Implement the `AlertDialog` component which will display the warning message as specified in the ticket. The dialog's content will be dynamic, showing the names of the organizations being merged. It will conditionally display a warning if the target organization's primary email does not exist among the source organization's member emails. The "Confirm Merge" button in this dialog will trigger the final merge action.
+Files: `components/organizations-management.tsx`
 
-**Step 4: Verify Case Ledger and Financial Reporting Logic**  
-This is a verification step. After the merge functionality is implemented, thoroughly test that financial views and reports function correctly. Specifically, review the logic in `getCaseLedgerObligation` and related functions to ensure that billing history and ledger data from the merged organization are correctly attributed to the target organization. No code changes are expected here unless testing reveals aggregation issues.
-Files: `lib/payments/case-ledger.ts`
+**Step 4: Handle Final Merge Confirmation and Action**  
+Create a new handler function, `handleConfirmMerge`, that will be triggered by the "Confirm Merge" button in the `AlertDialog`. This function will call the existing `mergeOrganizations` server action. It will reuse the `isMerging` state to show a loading indicator on the confirmation button and will handle the success/error toast notifications and dialog closing logic upon completion.
+Files: `components/organizations-management.tsx`
 
-**Risk Level:** HIGH — The action of merging organizations is destructive and irreversible. It involves complex database updates across multiple tables (users, cases, billing, payments). An error in the transaction could lead to data corruption, orphaned records, or incorrect financial reporting. The risk is heightened by the lack of explicit acceptance criteria for handling data conflicts between the merging entities.
-
-**Deployment Notes:**
-- This is a high-risk, irreversible action. It should be deployed behind a feature flag and initially tested in a staging environment with production data copies.
-- An announcement should be made to internal admin users about the new functionality, with clear instructions on its use and associated risks.
+**Risk Level:** LOW — The changes are confined to an existing administrative feature and are primarily additive (a new server action and a confirmation modal). The core merge logic in `mergeOrganizations` is not being altered. The risk is low as the changes introduce a safety check rather than modifying the destructive action itself.
 
 ## Proposed Code Changes
 
-### `lib/actions/organization.ts` (modify)
-This change adds two new server actions. `getAllOrganizationsForAdmin` provides the data needed for the new merge UI. `mergeOrganizations` is the core of the feature, performing the database updates within a transaction to ensure data integrity. It reassigns all related entities from the source organization to the target before deleting the source, and is protected by admin role checks.
+### `lib/actions/admin.ts` (modify)
+This new server action, `getOrganizationMergeDetails`, is required to fetch the necessary data for the confirmation modal. It retrieves the names of both organizations, the target organization's primary email, and all member emails from the source organization. This allows the frontend to perform the validation check and display the appropriate warning message as requested by the ticket.
 ```typescript
---- a/lib/actions/organization.ts
-+++ b/lib/actions/organization.ts
-@@ -1,9 +1,12 @@
- "use server";
- 
-+import { revalidatePath } from "next/cache";
-+import { z } from "zod";
- import { auth } from "@/lib/auth/server";
- import { headers } from "next/headers";
- import { prisma } from "@/lib/database";
- import { OrganizationType } from "@prisma/client";
-+import { hasRequiredRole } from "../auth/permissions";
- 
- type ActionResult<T = unknown> = {
-   success: boolean;
-@@ -73,3 +76,112 @@
-     return { success: false, error: "Failed to search organizations" };
-   }
+--- a/lib/actions/admin.ts
++++ b/lib/actions/admin.ts
+@@ -1717,6 +1717,57 @@
+   return 1;
  }
-+
-+/**
-+ * Get all organizations for admin selection UI.
-+ * Not paginated. Use with caution.
-+ */
-+export async function getAllOrganizationsForAdmin(): Promise<
-+  ActionResult<Array<{ id: string; name: string; email: string | null }>>
-+> {
+ 
++export async function getOrganizationMergeDetails(
++  targetOrganizationId: string,
++  sourceOrganizationId: string
++) {
 +  try {
-+    const session = await auth.api.getSession({ headers: await headers() });
-+    if (!session) return { success: false, error: "Authentication required" };
++    await requireOrganizationManagementPermissions();
 +
-+    if (!hasRequiredRole(session.user.role, ["master-admin", "capitol-bridge-admin"])) {
-+      return { success: false, error: "Unauthorized" };
++    if (!targetOrganizationId || !sourceOrganizationId) {
++      throw new Error("Both target and source organization IDs are required.");
 +    }
 +
-+    const organizations = await prisma.organization.findMany({
-+      select: { id: true, name: true, email: true },
-+      orderBy: { name: "asc" },
-+    });
-+    return { success: true, data: organizations };
-+  } catch (error) {
-+    console.error("Error fetching all organizations:", error);
-+    return { success: false, error: "Failed to fetch organizations" };
++    const [targetOrg, sourceOrg] = await Promise.all([
++      prisma.organization.findUnique({
++        where: { id: targetOrganizationId },
++        select: { id: true, name: true, email: true },
++      }),
++      prisma.organization.findUnique({
++        where: { id: sourceOrganizationId },
++        select: {
++          id: true,
++          name: true,
++          members: {
++            select: {
++              user: {
++                select: { email: true },
++              },
++            },
++          },
++        },
++      }),
++    ]);
++
++    if (!targetOrg || !sourceOrg) {
++      throw new Error("One or both organizations not found.");
++    }
++
++    const sourceMemberEmails = sourceOrg.members
++      .map((member) => member.user.email)
++      .filter((email): email is string => !!email);
++
++    return {
++      success: true,
++      data: {
++        targetOrg: { id: targetOrg.id, name: targetOrg.name, primaryEmail: targetOrg.email },
++        sourceOrg: { id: sourceOrg.id, name: sourceOrg.name, memberEmails: sourceMemberEmails },
++      },
++    };
++  } catch (error: any) {
++    console.error("Get organization merge details error:", error);
++    return { success: false, error: error.message || "Failed to fetch organization details for merge." };
 +  }
 +}
 +
-+const MergeOrganizationsSchema = z.object({
-+  sourceOrgId: z.string().cuid(),
-+  targetOrgId: z.string().cuid(),
-+});
-+
-+export async function mergeOrganizations(
-+  sourceOrgId: string,
-+  targetOrgId: string
-+): Promise<ActionResult<{ success: boolean }>> {
-+  try {
-+    const session = await auth.api.getSession({ headers: await headers() });
-+    if (!session) {
-+      return { success: false, error: "Authentication required" };
-+    }
-+
-+    if (!hasRequiredRole(session.user.
-... (truncated — see full diff in files)
+ export async function mergeOrganizations(
+   primaryOrganizationId: string,
+   secondaryOrganizationId: string
 ```
 
-### `app/dashboard/company/page.tsx` (modify)
-This change modifies the main company management page to support the new merge feature. It fetches the list of all organizations and passes them to the new `MergeControls` client component, which will handle the user interaction for selecting and merging organizations. The existing `CompanyPageClient` is preserved and rendered below the new merge UI.
+### `components/organizations-management.tsx` (modify)
+These changes update the organization management component to support the new merge confirmation flow.
+1.  **State and Imports**: New state variables (`mergeConfirmOpen`, `mergeDetails`, `isFetchingMergeDetails`) are added to manage the confirmation modal and its data. `AlertDialog` components and the `AlertTriangle` icon are imported.
+2.  **Event Handlers**: The original `handleMergeOrganizations` is replaced by two new functions:
+    *   `handleInitiateMerge`: Triggered by the form, it calls the new `getOrganizationMergeDetails` action and opens the confirmation modal with the fetched data.
+    *   `handleConfirmMerge`: Triggered by the confirmation modal, it executes the actual `mergeOrganizations` action and handles the final UI updates.
+3.  **UI**: An `AlertDialog` is added to display the confirmation message and the conditional warning about email mismatches. The "Combine" button in the initial form is updated to show a "Checking..." state while fetching details. This provides a safer, more informative user experience, preventing accidental merges.
 ```
---- a/app/dashboard/company/page.tsx
-+++ b/app/dashboard/company/page.tsx
-@@ -4,6 +4,7 @@
- import { listAdminInvitations } from "@/lib/actions/admin-invitations";
- import { listPartyInvitations } from "@/lib/actions/party-invitations";
- import { getPartyUsersWithOrganizations } from "@/lib/actions/party-users";
-+import { getAllOrganizationsForAdmin } from "@/lib/actions/organization";
+--- a/components/organizations-management.tsx
++++ b/components/organizations-management.tsx
+@@ -17,6 +17,16 @@
+   DialogTitle,
+   DialogTrigger,
+ } from "@/components/ui/dialog";
++import {
++  AlertDialog,
++  AlertDialogAction,
++  AlertDialogCancel,
++  AlertDialogContent,
++  AlertDialogDescription,
++  AlertDialogFooter,
++  AlertDialogHeader,
++  AlertDialogTitle,
++} from "@/components/ui/alert-dialog";
  import {
-   serializeAdminInvitation,
-   serializePartyInvitation,
-@@ -14,6 +15,7 @@
-   PartyInvitationSummary,
- } from "@/lib/types/invitations";
- import type { PartyUserWithOrganizations } from "@/lib/actions/party-users";
- import CompanyPageClient from "./company-page-client";
-+import MergeControls from "./merge-controls";
+   Table,
+   TableBody,
+@@ -50,6 +60,7 @@
+   ChevronsUpDown,
+   Check,
+   Network,
++  AlertTriangle,
+ } from "lucide-react";
+ import {
+   createOrganization,
+@@ -57,6 +68,7 @@
+   listOrganizations,
+   updateOrganizationDetails,
+   mergeOrganizations,
++  getOrganizationMergeDetails,
+ } from "@/lib/actions/admin";
+ import { ManageMembersDialog } from "./organizations/manage-members-dialog";
+ import {
+@@ -122,6 +134,19 @@
+   otherOrganizations: Array<{ id: string; name: string }>;
+ }
  
- export default async function CompanyPage() {
-   const session = await getCurrentSession();
-@@ -29,10 +31,11 @@
-     redirect("/dashboard");
-   }
- 
--  const [adminInvitationsResult, partyInvitationsResult, partyUsersResult] = await Promise.all([
-+  const [adminInvitationsResult, partyInvitationsResult, partyUsersResult, organizationsResult] = await Promise.all([
-     listAdminInvitations(),
-     listPartyInvitations(),
-     getPartyUsersWithOrganizations(),
-+    getAllOrganizationsForAdmin(),
-   ]);
- 
-   const adminInvitations: AdminInvitationSummary[] =
-@@ -62,4 +65,22 @@
-         .filter(Boolean)
-         .join(" - ") || "Unable to load party invitations";
- 
-+  const organizations = organizationsResult.success ? organizationsResult.data : [];
-+  // TODO: Handle organizationsError, maybe show an alert to the user
++interface MergeDetails {
++  targetOrg: {
++    id: string;
++    name: string;
++    primaryEmail: string | null;
++  };
++  sourceOrg: {
++    id: string;
++    name: string;
++    memberEmails: string[];
++  };
++}
 +
-   return (
-+    <div className="space-y-8">
-+      <MergeControls organizations={organizations || []} />
-+      <CompanyPageClient
-+        adminInvitations={adminInvitations}
-+        partyInvitations={partyInvitations}
-+        partyUsers={
-+          partyUsersResult.success ? partyUsersResult.data.partyUsers : []
-+        }
-+        adminInvitationsError={adminInvitationsError}
-+        partyInvitationsError={partyInvitationsError}
-+      />
+ const FILTER_DEFINITIONS = [
+   {
+     value: "financial-enabled",
+@@ -361,6 +386,10 @@
+   const [isMerging, setIsMerging] = useState(false);
+   const [mergeError, setMergeError] = useState<string | null>(null);
+ 
++  const [mergeConfirmOpen, setMergeConfirmOpen] = useState(false);
++  const [mergeDetails, setMergeDetails] = useState<MergeDetails | null>(null);
++  const [isFetchingMergeDetails, setIsFetchingMergeDetails] = useState(false);
 +
-... (truncated — see full diff in files)
-```
-
-### `app/dashboard/company/merge-controls.tsx` (create)
-This new client component provides the UI for selecting the source and target organizations for the merge operation. It maintains the state for user selections and controls the visibility of the confirmation modal. Creating this as a separate component allows us to keep the main page (`page.tsx`) as a Server Component while encapsulating interactive, client-side logic here.
-```
-"use client";
-
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Label } from "@/components/ui/label";
-import { MergeOrganizationWarningModal } from "@/components/company/merge-organization-warning-modal";
-
-type OrganizationData = {
-  id: string;
-  name: string;
-  email: string | null;
-};
-
-interface MergeControlsProps {
-  organizations: OrganizationData[];
-}
-
-export default function MergeControls({ organizations }: MergeControlsProps) {
-  const router = useRouter();
-  const [sourceOrgId, setSourceOrgId] = useState<string | null>(null);
-  const [targetOrgId, setTargetOrgId] = useState<string | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState(false);
-
-  const sourceOrg = organizations.find(o => o.id === sourceOrgId) || null;
-  const targetOrg = organizations.find(o => o.id === targetOrgId) || null;
-
-  const handleMergeSuccess = () => {
-    setSourceOrgId(null);
-    setTargetOrgId(null);
-    // Refresh the page to show updated organization list
-    router.refresh();
-  };
-
-  const canMerge = sourceOrgId && targetOrgId && sourceOrgId !== targetOrgId;
-
-  return (
-    <>
-      <Card>
-        <CardHeader>
-          <CardTitle>Merge Organizations</CardTitle>
-          <CardDescription>
-            Select two organizations to merge. All data from the source organization will be moved to the target organization, and the source organization will be deleted. This action is irreversible.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-6 sm:grid-cols-3">
-          <div className="grid gap-2">
-            <Label htmlFor="source-org">Source Organization (to be merged and deleted)</Label>
-            <Select value={sourceOrgId ?? ""} onValueCha
-... (truncated — see full diff in files)
-```
-
-### `components/company/merge-organization-warning-modal.tsx` (create)
-This new modal component fulfills a key requirement from the ticket. It presents a clear warning to the user about the consequences of merging organizations, including a specific alert for email mismatches. To prevent accidental confirmation, it requires the user to type "MERGE" before enabling the final confirmation button, which then invokes the `mergeOrganizations` server action.
-```
-"use client";
-
-import { useState } from "react";
-import { toast } from "react-hot-toast";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { mergeOrganizations } from "@/lib/actions/organization";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Terminal } from "lucide-react";
-
-interface OrganizationData {
-  id: string;
-  name: string;
-  email?: string | null;
-}
-
-interface MergeOrganizationWarningModalProps {
-  isOpen: boolean;
-  onOpenChange: (isOpen: boolean) => void;
-  sourceOrg: OrganizationData | null;
-  targetOrg: OrganizationData | null;
-  onMergeSuccess: () => void;
-}
-
-const CONFIRMATION_TEXT = "MERGE";
-
-export function MergeOrganizationWarningModal({
-  isOpen,
-  onOpenChange,
-  sourceOrg,
-  targetOrg,
-  onMergeSuccess,
-}: MergeOrganizationWarningModalProps) {
-  const [confirmationInput, setConfirmationInput] = useState("");
-  const [isMerging, setIsMerging] = useState(false);
-
-  if (!sourceOrg || !targetOrg) {
-    return null;
-  }
-
-  const handleMerge = async () => {
-    setIsMerging(true);
-    const toastId = toast.loading("Merging organizations...");
-
-    try {
-      const result = await mergeOrganizations(sourceOrg.id, targetOrg.id);
-
-      if (result.success) {
-        toast.success("Organizations merged successfully.", { id: toastId });
-        onMergeSuccess();
-        onOpenChange(false);
-        setConfirmationInput("");
-      } else {
-        toast.error(result.error || "Failed to merge organizations.", { id: toastId });
-      }
-    } catch (error) {
-      toast.error("An unexpected error occurred.", { id: toastId });
-      console.error("Merge failed:", error);
-    } finally {
-      setIsMerging(false);
-    }
-  };
-
-  const emailsMatch = sourceOrg.em
+ 
+   const [searchTerm, setSearchTerm] = useState("");
+   const [activeFilters, setActiveFilters] = useState<string[]>([]);
+@@ -463,6 +492,19 @@
+     });
+   }, [organizations, searchTerm, activeFilters]);
+ 
++  const emailMismatch = useMemo(() => {
++    if (!mergeDetails) return false;
++    const { targetOrg, sourceOrg } = mergeDetails;
++    // Only show warning if target org has a primary email and it's not found among source members
++    
 ... (truncated — see full diff in files)
 ```
 
 **New Dependencies:**
-- ``zod` (already a dependency, used for schema validation in the new server action)`
-- ``react-hot-toast` (assumed to be an existing dependency for user feedback)`
+- `_No new dependencies needed_`
 
 ## Test Suggestions
 
-Framework: `Jest`
+Framework: `Vitest`
 
-- **shouldSuccessfullyMergeTwoOrganizations** — Verifies the happy path for the mergeOrganizations server action, ensuring all database operations within the transaction complete successfully for an admin user.
-- **shouldThrowErrorIfUserIsNotAdmin** — Ensures that only users with the 'admin' role can perform the merge operation.
-- **shouldThrowErrorIfSourceAndTargetAreTheSame** *(edge case)* — Validates that the function prevents a user from selecting the same organization as both the source and the destination for a merge.
-- **shouldRollbackTransactionOnDatabaseError** *(edge case)* — Verifies that if any step in the database transaction fails, the entire operation is aborted and an error is handled gracefully.
-- **shouldDisplayEmailMismatchWarningWhenEmailsDiffer** — Tests that the modal correctly displays a warning when the primary emails of the two organizations do not match, as per the ticket's requirements.
-- **shouldEnableConfirmButtonWhenUserTypesMerge** — Ensures the safety check requiring the user to type 'MERGE' correctly enables the confirmation button.
-- **shouldKeepConfirmButtonDisabledForIncorrectInput** *(edge case)* — Verifies that the confirmation button is not enabled unless the user types the exact required string "MERGE".
-- **shouldCallOnConfirmWhenEnabledButtonIsClicked** — Tests that the `onConfirm` callback is triggered when the user completes the confirmation action.
-- **shouldEnableMergeButtonWhenTwoDifferentOrganizationsAreSelected** — Verifies the primary happy path of the control component, allowing the user to proceed once valid selections are made.
-- **shouldKeepMergeButtonDisabledIfSameOrganizationIsSelected** *(edge case)* — Tests the validation logic that prevents a user from merging an organization with itself.
-- _(+1 more test cases)_
+- **shouldReturnCorrectMergeDetailsForValidOrganizations** — Verifies that the server action correctly fetches and returns the required data for the merge confirmation modal when given valid inputs.
+- **shouldThrowErrorIfOrganizationNotFound** *(edge case)* — Ensures the server action handles cases where one or both of the specified organizations do not exist.
+- **shouldDisplayWarningModalWhenPrimaryEmailsDoNotMatch** — Tests the primary feature requirement: a warning modal is shown when a potential email mismatch is detected between the two organizations.
+- **shouldDisplayStandardConfirmationWhenEmailsMatch** — Verifies that the special warning is omitted when there is no email mismatch, providing a standard confirmation flow.
+- **shouldCallMergeOrganizationsActionOnConfirm** — Ensures that the final merge action is triggered correctly when the user confirms the operation in the modal.
+- **shouldNotCallMergeActionAndCloseModalOnCancel** — Tests the cancellation flow, ensuring that no merge action is performed if the user cancels.
+- **shouldHandleErrorWhenFetchingMergeDetailsFails** *(edge case)* — Verifies that the UI gracefully handles server errors when fetching pre-merge details, providing clear feedback to the user.
 
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This Product Requirements Document is the most critical source of information. It should define the data model, business rules, and constraints for the 'Organization' entity, which is essential for understanding how to merge records, permissions, and billing history correctly.
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This overview describes the existing Organization Management tools. The new merge functionality will be an extension of this toolset, and this document provides context on the current user interface and administrative capabilities that the developer must align with.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This Product Requirements Document (PRD) is the foundational document for the entire Organization Management feature, of which this ticket is a part. It details the core problem of duplicate organizations, the target two-level data model (Parent/Sub-Organization), the four key actor types, and the original deduplication strategy. It provides the essential business context and technical constraints for the developer.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This document provides a user-focused overview of the existing "Duplicate Organization Detection" and "Combine Organizations" tools. It is relevant because it shows the current implementation and UI that the developer is tasked with refining, including the detection logic (name similarity, domain match) and the entry points for the combine action.
+- [Proposed Changes to Address Current Issues](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/246906881) — This page contains high-level meeting notes that explicitly call out the need to "Add intelligent suggestions to easily identify duplicate organizations" for the "Organization Merge Tool". Crucially, it also identifies a key operational constraint: merging is currently blocked by invoice-related bugs, a critical piece of information for the developer implementing the merge logic.
 
 **Suggested Documentation Updates:**
 
-- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This PRD should be updated to include the new "Merge Organization" functionality, detailing the business rules for the suggestion engine and the data consolidation logic.
-- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: This document will need to be updated upon release to include instructions and details about the new organization merging feature for administrators.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System: This PRD outlines the plan for organization management. It should be updated to reflect the specific logic and UI/UX implemented for the refined merge/combine functionality.
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview: This document serves as a user guide for the admin tools. It will need to be updated with new screenshots and descriptions of the refined "Combine Organizations" workflow, including the new warning modal.
 
 ## AI Confidence Scores
-Plan: 80%, Code: 90%, Tests: 95%
+Plan: 100%, Code: 95%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

@@ -3,64 +3,56 @@
 **Jira Ticket:** [IDRE-637](https://orchidsoftware.atlassian.net//browse/IDRE-637)
 
 ## Summary
-This plan addresses the missing "All Organizations" option in the dropdown on the Party Portal's Members page. The fix involves modifying the `PartyPaymentsSection` component to prepend an "All Organizations" entry to the list of organizations before it is passed down to the `PartyUserPayments` component for rendering. This is a targeted, single-file UI change.
+This plan addresses the missing "All Organizations" option in the Members page dropdown by enabling the `showViewAll` prop on the `OrganizationSwitcher` component within `app/app/members/components/members-management.tsx`.
 
 ## Implementation Plan
 
-**Step 1: Add "All Organizations" to Organizations Dropdown List**  
-In the `PartyPaymentsSection` component, create a new array for organizations that prepends an "All Organizations" option to the `overview.organizations` list. This new object should have a unique `id` (e.g., "all") and a `name` of "All Organizations", with other properties set to `null` to match the `OrganizationSummary` type. Pass this new, modified array to the `organizations` prop of the `PartyUserPayments` component.
-Files: `app/dashboard/company/party/[partyUserId]/components/party-payments-section.tsx`
+**Step 1: Enable "All Organizations" option in OrganizationSwitcher**  
+In the `MembersManagement` component, locate the `OrganizationSwitcher` instance around line 351. Add the `showViewAll={true}` prop to this component. This will enable the display of the "All Organizations" option in the dropdown, as the `OrganizationSwitcher` defaults this behavior to off.
+Files: `app/app/members/components/members-management.tsx`
 
-**Risk Level:** LOW — The change is a minor addition to the data being passed to a UI component and is unlikely to have side effects. The only risk is if the receiving component, `PartyUserPayments`, has logic that cannot handle the added "all" option, but this is a standard pattern for filters.
+**Risk Level:** LOW — The change is a single prop addition to a UI component to enable an existing, but hidden, feature. The risk of unintended side effects is very low as it's a targeted change within a specific component on the Members page.
 
 ## Proposed Code Changes
 
-### `app/dashboard/company/party/[partyUserId]/components/party-payments-section.tsx` (modify)
-As per the implementation plan, the "All Organizations" option was missing from the dropdown. This change intercepts the `overview.organizations` array and prepends a new object representing "All Organizations". This modified array is then passed to the `PartyUserPayments` component, ensuring the option is available for selection in the UI.
+### `app/app/members/components/members-management.tsx` (modify)
+As per the implementation plan, the `OrganizationSwitcher` component on the members management page was missing the `showViewAll` prop. This prop defaults to `false`, which hides the "All Organizations" option. By explicitly adding `showViewAll={true}`, we enable this option in the dropdown, allowing users to view members across all their accessible organizations.
 ```
---- a/app/dashboard/company/party/[partyUserId]/components/party-payments-section.tsx
-+++ b/app/dashboard/company/party/[partyUserId]/components/party-payments-section.tsx
-@@ -13,11 +13,23 @@
-     return null;
-   }
- 
-+  const organizationsWithAll = [
-+    {
-+      id: "all",
-+      name: "All Organizations",
-+      // The OrganizationSummary type is assumed to allow null for properties
-+      // other than id and name, as this is a synthetic entry for the UI filter.
-+      type: null,
-+      logo: null,
-+    },
-+    ...overview.organizations,
-+  ];
-+
-   return (
-     <div className="space-y-6">
-       <PartyUserPayments
-         payments={overview.payments}
--        organizations={overview.organizations}
-+        organizations={organizationsWithAll}
-         partyUserId={overview.partyUserId}
+--- a/app/app/members/components/members-management.tsx
++++ b/app/app/members/components/members-management.tsx
+@@ -350,6 +350,7 @@
+         }))}
+         selectedOrganizationId={selectedOrgId}
+         hrefBase="/app/members"
++        showViewAll={true}
        />
      </div>
+     <div className="flex items-center gap-2">
 ```
 
 **New Dependencies:**
 - `None`
 
+## Test Suggestions
+
+Framework: `Jest`
+
+- **shouldRenderOrganizationSwitcherWithShowViewAllProp** — This test directly verifies that the code change was applied and the MembersManagement component correctly passes the `showViewAll={true}` prop to its child OrganizationSwitcher component. This is a focused unit test that isolates the component's behavior.
+- **shouldDisplayAllOrganizationsOptionWhenSwitcherIsClicked** — This test validates the end-user impact of the change. It ensures that passing the `showViewAll` prop correctly results in the "All Organizations" option being rendered and visible to the user, effectively serving as a regression test for the bug fix.
+
 ## Confluence Documentation References
 
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This is the Product Requirements Document (PRD) for the Organization Management System. It is the most relevant page as it should contain the definitive business rules, user stories, and acceptance criteria for how the organization dropdown and member visibility are intended to function. It is the primary source of truth for the expected behavior.
-- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This document provides a high-level overview of the Organization Management feature, likely for release communications or internal training. It should contain screenshots and descriptions of the intended UI, which will help the developer visually confirm the expected outcome of the bug fix.
+- [IDRE Platform Weekly Work Summary: April 8, 2026 Updates and Enhancements](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/318275601) — This page lists a recently completed ticket, IDRE-705, with the description "Party Portal: Not able to see all organizations in filter dropdown". This is nearly identical to the current ticket, IDRE-637, indicating the developer should investigate the previous fix as it may be a regression or an incomplete solution.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — This PRD defines the foundational business rules and data model for the Organization Management system. It specifies the strict two-level (Parent/Child) hierarchy and states that a user can be associated with multiple organizations. This context is essential for understanding why a user might need an "All Organizations" option and how the underlying data is structured.
+- [IDRE Dispute Platform Release: Organization Management and Admin Tools Overview](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/315654145) — This document describes the implemented features and UI for organization management. The "Organizations Tab" section details the various filters available to administrators (e.g., MAIN, PROVIDER, AGGREGATOR). This provides context for the types of filtering capabilities that exist in the system, which likely informs the expected behavior of the dropdown in the Party Portal.
 
 **Suggested Documentation Updates:**
 
-- "IDRE Dispute Platform Release: Organization Management and Admin Tools Overview" - This page likely contains screenshots and user-facing descriptions of the Organization Management feature. It should be updated with new screenshots after the bug is fixed to accurately reflect the corrected UI, including the "All Organizations" option.
+- Product Requirements Document for IDRE Dispute Platform's Organization Management System
+- IDRE Dispute Platform Release: Organization Management and Admin Tools Overview
 
 ## AI Confidence Scores
-Plan: 90%, Code: 95%
+Plan: 90%, Code: 85%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

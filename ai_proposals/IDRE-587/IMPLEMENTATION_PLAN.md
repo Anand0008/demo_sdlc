@@ -3,81 +3,102 @@
 **Jira Ticket:** [IDRE-587](https://orchidsoftware.atlassian.net//browse/IDRE-587)
 
 ## Summary
-This plan will reopen two incorrectly closed cases by creating a new Prisma database migration. The migration will contain SQL statements to update the status of the two cases to 'FINAL_DETERMINATION_PENDING' and delete the associated refund records from the `payment` and `case_payment_allocation` tables. This approach is direct, auditable, and the standard procedure for database changes.
+This plan outlines the creation of a one-off database script to reopen two incorrectly closed cases. The script will replicate existing financial cleanup logic from `lib/actions/arbitration.ts` to safely remove associated refunds and payments, then update the case status to `FINAL_DETERMINATION_PENDING` as required. An audit log entry will be created for each case. The script will include a `--dry-run` mode for safety, and no production application code will be modified.
 
 ## Implementation Plan
 
-**Step 1: Create a new Prisma migration file**  
-Use the Prisma CLI command `prisma migrate dev --create-only --name reopen_idre_587_cases` to generate a new, empty migration file. This file will contain the SQL statements to perform the data correction.
-Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+**Step 1: Create New Script File**  
+Create a new script file. This script will be a standalone executable for this one-off task and will not be part of the main application runtime. It will contain all logic for finding the cases, cleaning up financial records, and updating the status.
+Files: `scripts/idre-587-reopen-incorrectly-closed-cases.ts`
 
-**Step 2: Update case statuses to 'FINAL_DETERMINATION_PENDING'**  
-Add an SQL `UPDATE` statement to the newly created `migration.sql` file. This statement will target the two specified case IDs and change their status to 'FINAL_DETERMINATION_PENDING'. The exact enum value was identified in the `prisma/migrations/20251104000000_add_closed_default_ip_nip_statuses/migration.sql` file.
+**Step 2: Implement Script Boilerplate and Argument Parsing**  
+In the new script, implement the basic structure for a command-line tool. This includes setting up the Prisma client instance, and adding argument parsing for case `disputeReferenceNumber`s and a `--dry-run` flag. Use `scripts/cleanup-closed-case-due-dates.ts` as a reference for the overall structure.
+Files: `scripts/idre-587-reopen-incorrectly-closed-cases.ts`
 
-Example SQL:
-`UPDATE \`case\` SET \`status\` = 'FINAL_DETERMINATION_PENDING' WHERE \`id\` IN ('<case_id_1>', '<case_id_2>');`
-Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+**Step 3: Replicate Financial Cleanup Logic**  
+Copy the logic from the `clearNonCompletedRefundArtifacts` function found in `lib/actions/arbitration.ts` into the new script. This logic, which will be wrapped in a Prisma transaction, is responsible for identifying and deleting any `CaseRefund` and associated `Payment` records that are not in a 'COMPLETED' status. This directly addresses the 'Refunds Removed' acceptance criterion. The file `lib/actions/arbitration.ts` will be used for reference only and will not be modified.
+Files: `scripts/idre-587-reopen-incorrectly-closed-cases.ts`
 
-**Step 3: Remove associated refund records**  
-Add SQL `DELETE` statements to the `migration.sql` file to remove refund records associated with the two cases. Based on the data model inferred from `lib/actions/administrative-closure.ts` and Confluence documentation, this will involve deleting from `case_payment_allocation` first to satisfy foreign key constraints, and then from the `payment` table.
+**Step 4: Update Case Status and Log Action**  
+Within the same Prisma transaction, after the financial cleanup logic, update the `Case` record's `status` field to `FINAL_DETERMINATION_PENDING`. Additionally, create a new `CaseAction` record to provide an audit trail, noting that the case was manually reopened as per ticket IDRE-587.
+Files: `scripts/idre-587-reopen-incorrectly-closed-cases.ts`
 
-Example SQL:
-`DELETE FROM \`case_payment_allocation\` WHERE \`paymentId\` IN (SELECT \`id\` FROM \`payment\` WHERE \`caseId\` IN ('<case_id_1>', '<case_id_2>') AND \`type\` = 'REFUND');`
-`DELETE FROM \`payment\` WHERE \`caseId\` IN ('<case_id_1>', '<case_id_2>') AND \`type\` = 'REFUND';`
-Files: `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql`
+**Step 5: Execute and Verify Script**  
+Execute the script in the target environment using the `--dry-run` flag first to log the intended changes without modifying the database. After verifying the output is correct, run the script without the flag to apply the changes. Manually verify the case statuses and absence of pending refunds in the database afterward.
 
-**Risk Level:** LOW — The change is a targeted data correction for only two specific records. Using a database migration provides a clear, version-controlled, and auditable record of the change. The primary risk is operational (running the migration correctly), which is mitigated by standard deployment procedures.
-⚠️ **Database Migrations Required: YES**
-
-**Deployment Notes:**
-- The Prisma migration must be run as part of the deployment process.
-- The changes should be verified in a staging environment before deploying to production.
+**Risk Level:** LOW — The risk is low because the change is a one-off data fix performed by a script, not a modification to the application code. The plan includes creating a new, isolated script and incorporating a `--dry-run` mode for verification before any data is changed. The complex logic for financial cleanup is being replicated from existing, tested code.
 
 ## Proposed Code Changes
 
-### `prisma/migrations/YYYYMMDDHHMMSS_reopen_idre_587_cases/migration.sql` (create)
-This new migration file is created to perform the specific data correction requested in ticket IDRE-587. Using a migration ensures the change is version-controlled, auditable, and applied consistently across all database environments. The SQL statements directly address the acceptance criteria by updating the case statuses and removing the associated refunds.
-```sql
-Type: create
+### `scripts/idre-587-reopen-incorrectly-closed-cases.ts` (create)
+This new script provides a safe and auditable way to perform the one-off database change required by IDRE-587. It is created in the `scripts/` directory, following project conventions for such tasks. The logic for clearing financial artifacts is carefully replicated from the existing `clearNonCompletedRefundArtifacts` server action to ensure correctness and avoid unintended side effects. The script includes a `--dry-run` mode for safety, argument parsing for specifying target cases, and detailed logging. All database modifications for a given case are wrapped in a transaction to ensure atomicity. A dedicated system user is used for audit log entries, providing a clear record of the script's actions.
+```typescript
+/**
+ * One-off script for IDRE-587 to reopen two incorrectly closed cases.
+ *
+ * This script will:
+ * 1. Identify cases by their disputeReferenceNumber.
+ * 2. Delete any associated non-completed refunds and payments.
+ * 3. Update the case status to FINAL_DETERMINATION_PENDING.
+ * 4. Create an audit log for the changes.
+ *
+ * Usage:
+ *   npx tsx scripts/idre-587-reopen-incorrectly-closed-cases.ts <ref1> <ref2> ... [--dry-run]
+ *
+ * Example:
+ *   npx tsx scripts/idre-587-reopen-incorrectly-closed-cases.ts DISPUTE-REF-123 DISPUTE-REF-456
+ *   npx tsx scripts/idre-587-reopen-incorrectly-closed-cases.ts DISPUTE-REF-123 --dry-run
+ */
 
-```sql
--- Reopen incorrectly closed cases for ticket IDRE-587.
--- This migration performs two actions:
--- 1. Updates the status of two specific cases to 'FINAL_DETERMINATION_PENDING'.
--- 2. Deletes the associated refund payments and their allocations for these cases.
+import { PrismaClient, CaseStatus, CaseActionType, Prisma } from "@prisma/client";
 
--- IMPORTANT: Replace '<case_id_1>' and '<case_id_2>' with the actual case IDs from the ticket.
+const prisma = new PrismaClient();
 
--- Step 1: Update case statuses
-UPDATE `case`
-SET `status` = 'FINAL_DETERMINATION_PENDING'
-WHERE `id` IN ('<case_id_1>', '<case_id_2>');
+// A stable user ID for system-initiated actions.
+const SCRIPT_USER_ID = "system-script-idre-587";
+const SCRIPT_USER_NAME = "System Script (IDRE-587)";
 
--- Step 2: Delete refund payment allocations
--- This must be done before deleting from the `payment` table to respect foreign key constraints.
-DELETE FROM `case_payment_allocation`
-WHERE `paymentId` IN (
-  SELECT `id` FROM `payment`
-  WHERE `caseId` IN ('<case_id_1>', '<case_id_2>') AND `type` = 'REFUND'
-);
+// This function is copied from lib/actions/arbitration.ts
+function buildRefundPaymentIdempotencyKey(params: {
+  caseId: string;
+  partyId: string;
+  refundType: string;
+  refundReason: string;
+}): string {
+  return [
+    "refund-payment",
+    params.caseId,
+    params.partyId,
+    params.refundType,
+    params.refundReason,
+  ].join(":");
+}
 
--- Step 3: Delete refund payments
-DELETE FROM `payment`
-WHERE `caseId` IN ('<case_id_1>', '<case_id_2>') AND `type` = 'REFUND';
-```
+// This function is a modified copy from lib/actions/arbitration.ts `clearNonCompletedRefundArtifacts`
+// It's adapted to work within this script.
+async function clearNonCompletedRefundArtifacts(
+  caseId: string,
+  tx: Prisma.TransactionClient
+): Promise<{ deletedRefundIds: string[]; deletedPaymentIds: string[] }> {
+  const pendingRefunds = await tx.caseRefund.findMany({
+    where: {
+      caseId,
+      status: {
+        not: "COMPLETED",
+      },
+    },
+    select: {
+      id: true,
+      partyId: true,
+      refundType: true,
+      refundReason: true,
+    },
+  });
 
-Rationale: This new migration file is created to perform the specific data correction requested in ticket IDRE-587. Using a migration ensures the change is version-controlled, auditable, and applied consistently across all database environments. The SQL statements directly address the acceptance criteria by updating the case statuses and removing the associated refunds.
-
-# Dependencies
-- None
-
-# Configuration Changes
-- None
-
-# Caveats
-- The placeholder values `<case_id_1>` and `<case_id_2>` in the SQL script must be replaced with the actual IDs of the two cases mentioned in the ticket before this migration is applied.
-- The `YYYYMMDDHHMMSS` portion of the file path is a placeholder for the timestamp that will be generated by the `prisma migrate dev --create-only` command.
-- This is a one-off data correction migration and is not intended for general use.
+  const pendingRefundIds = pendingRefunds.map((refund) => refund.id);
+  const pendingRefundPaymentKeys = pendingRefunds.map((refund) =>
+    buildRefundPaymentIdempotencyK
+... (truncated — see full diff in files)
 ```
 
 **New Dependencies:**
@@ -87,21 +108,22 @@ Rationale: This new migration file is created to perform the specific data corre
 
 Framework: `Jest`
 
-- **shouldReopenCasesAndRemoveRefunds** — This test validates that the database migration correctly reopens the two specified cases and removes their associated refund data as intended. Since this change is a raw SQL migration and not application code, a traditional unit test is not applicable. Instead, this should be an integration test that runs against a real or containerized test database.
+- **shouldUpdateCaseStatusDeleteArtifactsAndCreateAuditLogInLiveMode** — Verifies that when run in live mode, the script correctly deletes financial artifacts, updates the case status, and creates an audit log within a single database transaction.
+- **shouldLogIntendedActionsAndNotPerformDbWritesInDryRunMode** — Ensures the --dry-run flag prevents any actual database modifications and instead logs the actions that would have been taken. This is a critical safety feature of the script.
+- **shouldThrowErrorIfCaseNotFound** *(edge case)* — Tests the error handling path for when a provided case ID cannot be found, ensuring the script fails gracefully without unintended side effects.
+- **shouldSkipExecutionIfCaseIsAlreadyInTheCorrectState** *(edge case)* — Tests the edge case where the script is run against a case that has already been fixed, ensuring it does not perform redundant operations.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page provides the canonical, step-by-step case lifecycle and status transitions. The ticket requires changing a case's status, and this document explains the valid states and the overall process flow that the developer must not violate.
-- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This document provides a high-level overview of the case workflow, defining the main phases (Eligibility, Payment Collection, Arbitration). This is essential context for a developer to understand where the 'final determination pending' status fits within the overall business process.
-- [Case Balance Report](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/308936719) — The ticket requires that 'Refunds Removed'. This page contains a SQL query that reveals the data model for case financials, showing the relationship between the `case` table and tables for payments and refunds (`case_payment_allocation`, `payment`). This is a direct technical pointer for the developer.
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This document provides the explicit business logic for the ticket. It specifies that closed cases can be reopened by an Admin and transitioned to the "FINAL_DETERMINATION_PENDING" status. Crucially, it details the automated financial transactions (Party Refunds, Internal Distributions) that are created upon case closure, which directly relates to the ticket's requirement to have "Refunds Removed".
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page provides a high-level overview of the end-to-end case lifecycle, defining the sequence of statuses from "New" to "Closed". It confirms that the "Determined" status (which is functionally equivalent to "final determination pending") immediately precedes the "Closure" phase, giving context to the state transition requested in the ticket.
 
 **Suggested Documentation Updates:**
 
-- IDRE Worflow: This document should be updated to include the process for reopening an incorrectly closed case, as the current lifecycle does not account for this exception.
-- IDRE Case Workflow Documentation: This page should also be updated to reflect the possibility of reopening a case, outlining the conditions and the target status to ensure the process is documented.
+- IDRE Case Workflow Documentation
 
 ## AI Confidence Scores
-Plan: 90%, Code: 95%, Tests: 100%
+Plan: 90%, Code: 95%, Tests: 90%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

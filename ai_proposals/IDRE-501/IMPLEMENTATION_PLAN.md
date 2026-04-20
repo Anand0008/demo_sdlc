@@ -3,120 +3,100 @@
 **Jira Ticket:** [IDRE-501](https://orchidsoftware.atlassian.net//browse/IDRE-501)
 
 ## Summary
-Implement an automated email notification with an attached $115 administrative fee invoice when a dispute is deemed ineligible or dismissed.
+This plan updates the email notification system to send a consistent "Ineligible / Dismissal" email. The core change involves modifying the `executeIneligiblePaymentWorkflow` function in `lib/actions/email-workflow.ts`. This function, triggered when a case is directly marked as ineligible, will be updated to send the same email template (`idr-dispute-not-eligible`) that is already used for cases marked as ineligible or dismissed through the administrative closure process. This ensures a uniform notification, including the correct email subject, body, and invoice attachment for the admin fee, across all ineligibility scenarios as required by the ticket.
 
 ## Implementation Plan
 
-**Step 1: Define Email Template Types**  
-Add a new email template type (e.g., `INELIGIBLE_DISMISSAL`) to the email service types. Define the required payload interface for this template, including `idrReferenceNumber` and `reason` (from the pop-up reason box).
-Files: `lib/services/email/types.ts`
+**Step 1: Update `executeIneligiblePaymentWorkflow` to Send 'Dispute Not Eligible' Email**  
+In `lib/actions/email-workflow.ts`, locate the `executeIneligiblePaymentWorkflow` function. This function is triggered when a case status changes to `INELIGIBLE_PENDING_ADMIN_FEE`. Modify this function to send the 'Dispute Not Eligible' email (template `idr-dispute-not-eligible`) instead of the current admin fee request email. This involves replicating the logic from the `sendAdministrativeClosureEmailsInternal` function for `isIneligibilityCase`. This includes preparing the `ineligibilityTemplateData`, constructing the subject "The Federal IDR Process is Not Applicable to This Dispute - {disputeReferenceNumber}", handling invoice attachments for the admin fee, and using `createIDRProcessEmailJob` to send the email. The `reason` parameter passed to the function should be used as the `ineligibilityReason` in the template data.
+Files: `lib/actions/email-workflow.ts`
 
-**Step 2: Implement Email Sending and Invoice Attachment Logic**  
-Update the action to trigger the new `INELIGIBLE_DISMISSAL` email when a case is marked as ineligible or dismissed. Construct the email body using the provided template text. Generate the $115 administrative fee invoice and attach it to the email payload. Ensure the dynamic fields (`idrReferenceNumber` and `reason`) are populated correctly.
-Files: `lib/actions/send-ineligibility-emails-action.ts`
-
-**Step 3: Update Email Preview Route**  
-Add support for the new `INELIGIBLE_DISMISSAL` template in the email preview API route. Provide sample data for `idrReferenceNumber` and `reason` to allow developers and QA to preview the rendered email template.
-Files: `app/api/email/idr-preview/route.ts`
-
-**Risk Level:** LOW — The changes are isolated to email notification and invoice attachment logic. Existing case state transitions and payment calculations are not modified, reducing the risk of unintended side effects.
-
-**Deployment Notes:**
-- Ensure the new email template is registered with the email service provider if using an external service like SendGrid, or ensure the internal template renderer is updated.
+**Risk Level:** LOW — The change is confined to a single server action responsible for email workflows. The logic being implemented is being adapted from an existing, similar workflow within the same file, reducing the risk of introducing new bugs. The primary risk is ensuring all necessary data for the email template and invoice generation is correctly fetched and passed, but this is mitigated by following the existing pattern.
 
 ## Proposed Code Changes
 
-### `lib/services/email/types.ts` (modify)
-Defines the required payload interface for the new `INELIGIBLE_DISMISSAL` email template, ensuring type safety for the dynamic fields (`idrReferenceNumber` and `reason`).
+### `lib/actions/email-workflow.ts` (modify)
+The `executeIneligiblePaymentWorkflow` function is updated to align with the email logic used for administrative closures (`sendAdministrativeClosureEmailsInternal`). Previously, it sent a notification to an internal-only email address. This change modifies it to:
+1.  Send the "Dispute Not Eligible" email directly to the initiating and non-initiating parties.
+2.  Use `createIDRProcessEmailJob` for consistency with other process-related emails.
+3.  Attach party-specific invoices to each email, rather than bundling all invoices into a single internal email.
+4.  Adopt the standardized template data and subject line used for ineligibility and dismissal notifications.
 ```typescript
---- a/lib/services/email/types.ts
-+++ b/lib/services/email/types.ts
-@@ -1,2 +1,7 @@
-+export interface IneligibleDismissalEmailPayload {
-+  idrReferenceNumber: string;
-+  reason: string;
-+}
-+
- // Existing types...
-```
-
-### `lib/actions/send-ineligibility-emails-action.ts` (create)
-Creates the server action responsible for constructing the email body using the provided template text, generating the $115 administrative fee invoice, and attaching it to the email payload.
-```typescript
-'use server';
-
-import { IneligibleDismissalEmailPayload } from '@/lib/services/email/types';
-// import { sendEmail } from '@/lib/services/email';
-// import { generateInvoicePdf } from '@/lib/services/invoice-service';
-
-export async function sendIneligibilityEmailAction(
-  to: string,
-  payload: IneligibleDismissalEmailPayload,
-  invoiceId?: string
-) {
-  const subject = `The Federal IDR Process is Not Applicable to This Dispute - ${payload.idrReferenceNumber}`;
-  
-  const html = `
-<p><strong>IDR dispute status:</strong> Not eligible</p>
-<p><strong>IDR reference number:</strong> ${payload.idrReferenceNumber}</p>
-<p>Capitol Bridge has reviewed your Independent Dispute Resolution (IDR) reference number ${payload.idrReferenceNumber} and determined that the dispute is not eligible to be resolved using the Federal IDR process for the following reason(s):</p>
-<ul>
-  <li><strong>${payload.reason}</strong></li>
-</ul>
-<p>Your Federal IDR dispute with reference number ${payload.idrReferenceNumber} has been closed. Keep this notice and your IDR reference number for your records.</p>
-<p>If you believe you have received this notice in error, please contact us immediately at <a href="mailto:IDR@capitolbridge.com">IDR@capitolbridge.com</a>. Include your IDR reference number above.</p>
-<p><strong>Next Steps:</strong></p>
-<p>There is one fee associated with this dispute:</p>
-<ul>
-  <li>The administrative fee, $115.00.</li>
-</ul>
-<p>An invoice for the outstanding administrative fee ($115) can be populated by logging in our secure portal. Payment is due upon receipt of this email. You may submit payment through our secure portal at <a href="https://app.veratru.com">https://app.veratru.com</a> by logging in using the email address this message was sent to for streamlined payment. Alternatively, you can pay using the instructions provided on the invoice once populated.</p>
-<p><strong>Resources</strong></p>
-<p>Visit the <a href="https://www.cms.gov/nosurprises">No Surprises website</a> for
-... (truncated — see full diff in files)
-```
-
-### `app/api/email/idr-preview/route.ts` (modify)
-Adds support for the new `INELIGIBLE_DISMISSAL` template in the email preview API route, providing sample data for `idrReferenceNumber` and `reason` to allow developers and QA to preview the rendered email template.
-```typescript
---- a/app/api/email/idr-preview/route.ts
-+++ b/app/api/email/idr-preview/route.ts
-@@ -1,5 +1,25 @@
- import { NextResponse } from 'next/server';
+--- a/lib/actions/email-workflow.ts
++++ b/lib/actions/email-workflow.ts
+@@ -2528,93 +2528,102 @@
+     }
  
- export async function GET(request: Request) {
-   const { searchParams } = new URL(request.url);
-   const template = searchParams.get('template');
-+
-+  if (template === 'INELIGIBLE_DISMISSAL') {
-+    const idrReferenceNumber = searchParams.get('idrReferenceNumber') || 'DISP-123456';
-+    const reason = searchParams.get('reason') || 'Open negotiations not completed.';
-+    
-+    return NextResponse.json({
-+      subject: `The Federal IDR Process is Not Applicable to This Dispute - ${idrReferenceNumber}`,
-+      html: `<p><strong>IDR dispute status:</strong> Not eligible</p>
-+<p><strong>IDR reference number:</strong> ${idrReferenceNumber}</p>
-+<p>Capitol Bridge has reviewed your Independent Dispute Resolution (IDR) reference number ${idrReferenceNumber} and determined that the dispute is not eligible to be resolved using the Federal IDR process for the following reason(s):</p>
-+<ul><li><strong>${reason}</strong></li></ul>
-+<p>Your Federal IDR dispute with reference number ${idrReferenceNumber} has been closed. Keep this notice and your IDR reference number for your records.</p>
-+<p>If you believe you have received this notice in error, please contact us immediately at <a href="mailto:IDR@capitolbridge.com">IDR@capitolbridge.com</a>. Include your IDR reference number above.</p>
-+<p><strong>Next Steps:</strong></p>
-+<p>There is one fee associated with this dispute:</p>
-+<ul><li>The administrative fee, $115.00.</li></ul>
-+<p>An invoice for the outstanding administrative fee ($115) can be populated by logging in our secure portal. Payment is due upon receipt of this email. You may submit payment through our secure portal at <a href="https://app.veratru.com">https://app.veratru.com</a> by logging in using the email address this message was sent to for streamlined payment. Alternatively, you can pay using the instructions provided
+     if (
+-      !caseData.initiatingParty?.email ||
+-      !caseData.nonInitiatingParty?.email
++      !caseData.initiatingParty?.email || !caseData.initiatingParty?.name ||
++      !caseData.nonInitiatingParty?.email || !caseData.nonInitiatingParty?.name
+     ) {
+       return {
+         success: false,
+-        error: "Case parties must have email addresses",
++        error: "Case parties must have names and email addresses",
+       };
+     }
+ 
+-    // Prepare template data for ineligible case using Template 9 (Dispute Not Eligible)
+-    const templateData = prepareIDRPaymentTemplateData(
+-      caseData,
+-      data.customPaymentInstructions,
+-      false // Don't include dispute details for ineligible cases
+-    );
+-
+-    // Add ineligibility reason, status, and early closure reason to template data
+-    // Only set disputeStatus for standard ineligibility cases, not early closures
+-    if (!data.earlyClosureReason) {
+-      templateData.disputeStatus = caseData.status === "INELIGIBLE" ? "Not eligible" : "Not eligible - pending admin fee";
+-    }
+-    templateData.ineligibilityReason =
+-      data.reason ||
+-      "the dispute does not meet the eligibility criteria for the Federal IDR process";
+-    templateData.earlyClosureReason = data.earlyClosureReason;
+-
+-    // Ineligibility emails are restricted to the NSA inbox only
+-    const NSA_EMAIL = "federalnsa@capitolbridge.com";
+-    const recipients = [NSA_EMAIL];
++    // Prepare template data for ineligibility/dismissal (Template 9)
++    const ineligibilitySubject = `The Federal IDR Process is Not Applicable to This Dispute - ${caseData.disputeReferenceNumber}`;
++    const ineligibilityTemplateData = {
++      disputeReferenceNumber: caseData.disputeReferenceNumber,
++      caseId: data.caseId,
++      disputeStatus: "Not eligible",
++      ineligibilityReason:
++        data.reason ||
++        "the dispute does 
 ... (truncated — see full diff in files)
 ```
+
+**New Dependencies:**
+- `_No new dependencies needed_`
 
 ## Test Suggestions
 
 Framework: `Vitest`
 
-- **should successfully send ineligibility email with invoice attachment** — Verifies that the server action correctly constructs the email payload, generates the invoice, and calls the email service.
-- **should throw an error and not send email if invoice generation fails** *(edge case)* — Ensures that if the invoice cannot be generated, the email is not sent and an error is thrown.
-- **should return preview HTML for INELIGIBLE_DISMISSAL template** — Verifies the preview API route correctly handles the new INELIGIBLE_DISMISSAL template type and injects mock data.
+- **shouldSendIneligibleEmailToBothPartiesWithTheirRespectiveInvoices** — This test verifies the primary success path where a dispute is marked ineligible, and both parties have valid emails and invoices. It ensures the correct email job is created for each party with their respective invoice attached.
+- **shouldSendEmailWithoutAttachmentIfPartyHasNoInvoice** *(edge case)* — This test covers the scenario where an invoice might not have been generated for one of the parties. It ensures that the email is still sent, but without an attachment.
+- **shouldNotAttemptToSendEmailToPartyWithMissingEmailAddress** *(edge case)* — This test ensures the function handles missing party contact information gracefully and does not attempt to send an email to a null address, which could cause an error.
+
+## Confluence Documentation References
+
+- [IDRE Case Workflow Documentation](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/229277697) — This page provides the most critical business logic for the ticket. It defines the exact status `INELIGIBLE_PENDING_ADMIN_FEE`, confirms the $115 admin fee is collected from the Initiating Party (IP), and explicitly states this fee is never refunded. This directly informs the content of the email and the reason for the attached invoice.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This document establishes the high-level business process where a case is marked 'Ineligible' during the Eligibility Review phase. It confirms that a notification is sent to both parties with the closure reason, which is the core requirement of the ticket.
+- [IDRE Stand up Notes](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/206602242) — This page provides direct context for the developer. It explicitly mentions ticket IDRE-501 and a technical issue where emails were not being sent correctly in the staging environment. It also references the parent ticket, IDRE-354, indicating its priority.
+- [IDRE Platform Weekly Work Summary: April 8, 2026 Updates and Enhancements](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/318275601) — This page highlights two other active tickets that are highly relevant to the scope of IDRE-501. 'IDRE-530' indicates known issues with invoicing for ineligible disputes, and 'IDRE-508' shows an existing requirement to include invoices in payment-related emails. This context is crucial for the developer to avoid conflicts and understand the technical landscape.
+
+**Suggested Documentation Updates:**
+
+- IDRE Case Workflow Documentation
+- IDRE Worflow
 
 ## AI Confidence Scores
-Plan: 85%, Code: 85%, Tests: 95%
+Plan: 90%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review

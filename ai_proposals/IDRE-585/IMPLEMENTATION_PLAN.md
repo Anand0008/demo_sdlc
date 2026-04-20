@@ -3,79 +3,79 @@
 **Jira Ticket:** [IDRE-585](https://orchidsoftware.atlassian.net//browse/IDRE-585)
 
 ## Summary
-This plan fixes a bug where creating or deleting an invoice does not consistently update the list of disputes awaiting payment. The root cause is incomplete cache invalidation; while the page data is refreshed, the cached overview statistics (like pending case counts) are not.
+This plan addresses a bug where not all disputes awaiting payment are correctly displayed to the user, leading to inconsistencies between the payment list, CSV downloads, and overview counts. The root cause is identified as incorrect filtering in `lib/actions/party-payments.ts`, where cases in a defaulted status are being hidden if they are associated with an old, unpaid invoice.
 
-The fix involves adding a specific cache revalidation call (`revalidatePartyPaymentOverview`) to two server actions:
-1.  `createInvoiceFromCases`: To update stats after an invoice is created.
-2.  `deletePendingInvoice`: To update stats after an invoice is deleted.
-
-These changes will ensure that both the list of cases and the summary counts on the payments page are synchronized, resolving the inconsistency reported in the ticket.
+The fix involves modifying the `hasActiveInvoice` logic within two functions in `lib/actions/party-payments.ts` (`getCasesForPayment` and the near-identical `getPaymentQueueStats`). The change will expand an existing exception to ensure that cases with `CLOSED_DEFAULT`, `CLOSED_DEFAULT_IP`, or `CLOSED_DEFAULT_NIP` statuses are always shown as needing payment, regardless of any associated pending invoices. This will align the UI, CSV export, and overview stats, and ensure the invoice lifecycle behaves consistently for all dispute types as described in the ticket.
 
 ## Implementation Plan
 
-**Step 1: Update Invoice Creation to Revalidate Payment Overview Cache**  
-In the `createInvoiceFromCases` function, import `revalidatePartyPaymentOverview` from `lib/payments/overview-cache.ts`. After the invoice is successfully created and existing paths are revalidated, add a call to `revalidatePartyPaymentOverview(session.user.id, invoiceOrganizationId)`. This will ensure that the cached payment overview statistics are invalidated when a new invoice is created, forcing the UI to refetch the correct counts.
-Files: `lib/actions/party-dashboard.ts`
+**Step 1: Update `hasActiveInvoice` logic in `getCasesForPayment`**  
+In the `getCasesForPayment` function, locate the `hasActiveInvoice` helper logic within the `cases.forEach` loop (around line 690). Modify the conditional check that currently bypasses the active invoice block for ineligible cases. Extend this condition to also include cases with statuses `CLOSED_DEFAULT`, `CLOSED_DEFAULT_IP`, and `CLOSED_DEFAULT_NIP`. This will ensure that cases that have defaulted still appear in the payment list to settle remaining fees, even if they are attached to an old, unpaid invoice.
+Files: `lib/actions/party-payments.ts`
 
-**Step 2: Update Invoice Deletion to Revalidate Payment Overview Cache**  
-In the `deletePendingInvoice` function, import `revalidatePartyPaymentOverview` from `lib/payments/overview-cache.ts`. After the invoice is successfully deleted (after the `prisma.invoice.delete` call), add a call to `revalidatePartyPaymentOverview(session.user.id, invoice.organizationId)`. This will invalidate the cached payment overview statistics, ensuring the counts of pending cases and invoices are updated correctly when an invoice is deleted.
-Files: `lib/actions/party-dashboard.ts`
+**Step 2: Update `hasActiveInvoice` logic in `getPaymentQueueStats` to match**  
+In the `getPaymentQueueStats` function, locate the duplicated `hasActiveInvoice` logic inside the `for (const case_ of batchCases)` loop (around line 1295). Apply the same modification as in the previous step to the conditional check for ineligible cases (around line 1307). Add `CLOSED_DEFAULT`, `CLOSED_DEFAULT_IP`, and `CLOSED_DEFAULT_NIP` to this condition. This ensures that the payment overview statistics are calculated using the same logic as the main payment list, resolving the discrepancy between the count of cases awaiting payment and the cases shown in the payments tab.
+Files: `lib/actions/party-payments.ts`
 
-**Risk Level:** LOW — The change is low-risk as it only involves adding cache invalidation calls to existing server actions. This is unlikely to have unintended side effects and directly targets the observed data inconsistency. The core logic for creating and deleting invoices remains untouched.
+**Risk Level:** LOW — The change is confined to a single server-side action file and modifies filtering logic that is already conditioned on case status. The risk of unintended side effects is low, as it broadens an existing exception for terminal case statuses. The logic is duplicated, so care must be taken to apply the fix in both places, but the change itself is straightforward.
 
 ## Proposed Code Changes
 
-### `lib/actions/party-dashboard.ts` (modify)
-The ticket describes an inconsistency between the list of cases awaiting payment and the summary statistics after creating or deleting an invoice. This is due to incomplete cache invalidation.
+### `lib/actions/party-payments.ts` (modify)
+This change modifies the `hasActiveInvoice` logic in both `getCasesForPayment` and the nearly identical `getPaymentQueueStats`. It extends an existing exception to ensure that cases with defaulted statuses (`CLOSED_DEFAULT`, `CLOSED_DEFAULT_IP`, `CLOSED_DEFAULT_NIP`) are always considered as needing payment, regardless of any associated pending invoices. This aligns the payment list, CSV export, and overview stats, resolving the inconsistency where these cases were incorrectly hidden from the user.
 ```typescript
---- a/lib/actions/party-dashboard.ts
-+++ b/lib/actions/party-dashboard.ts
-@@ -34,6 +34,7 @@
-   getPartyPaymentOverviewScopeTag,
-   getPartyPaymentOverviewUserTag,
-   PARTY_PAYMENT_OVERVIEW_CACHE_TTL_SECONDS,
-+  revalidatePartyPaymentOverview,
- } from "@/lib/payments/overview-cache";
+--- a/lib/actions/party-payments.ts
++++ b/lib/actions/party-payments.ts
+@@ -703,8 +703,11 @@
+         // should have been MISSING_BANK_INFO. They must never block payment.
+         if (
+           case_.status === "INELIGIBLE_PENDING_ADMIN_FEE" ||
+-          case_.status === "INELIGIBLE"
++          case_.status === "INELIGIBLE" ||
++          case_.status === "CLOSED_DEFAULT" ||
++          case_.status === "CLOSED_DEFAULT_IP" ||
++          case_.status === "CLOSED_DEFAULT_NIP"
+         ) {
+           return false;
+         }
+@@ -1306,8 +1309,11 @@
  
- /**
-@@ -2377,6 +2378,8 @@
- 
-     const organizationNames = Array.from(organizationNamesForInvoice);
- 
-+    revalidatePartyPaymentOverview(session.user.id, invoiceOrganizationId);
-+
-     return {
-       success: true,
-       data: {
-@@ -2623,6 +2626,8 @@
- 
-     await prisma.invoice.delete({ where: { id: invoiceId } });
- 
-+    revalidatePartyPaymentOverview(session.user.id, invoice.organizationId);
-+
-     // Revalidate paths so the invoice queue and payment tab reflect the change
-     if (invoice.organizationId) {
-       revalidatePath(`/dashboard/organizations/${invoice.organizationId}/financial`);
+                   if (
+                     case_.status === "INELIGIBLE_PENDING_ADMIN_FEE" ||
+-                    case_.status === "INELIGIBLE"
++                    case_.status === "INELIGIBLE" ||
++                    case_.status === "CLOSED_DEFAULT" ||
++                    case_.status === "CLOSED_DEFAULT_IP" ||
++                    case_.status === "CLOSED_DEFAULT_NIP"
+                   ) {
+                     return false;
+                   }
 ```
 
 **New Dependencies:**
-- `_No new dependencies needed_`
+- `None`
+
+## Test Suggestions
+
+Framework: `Jest`
+
+- **shouldIncludeDefaultedCasesEvenWithPendingInvoice** *(edge case)* — This is a regression test to reproduce the bug. It verifies that cases with a defaulted status are correctly included in the payment list, even when they are attached to an unpaid (pending) invoice. This ensures the fix works as intended.
+- **shouldCountDefaultedCasesInStatsEvenWithPendingInvoice** *(edge case)* — This test verifies that the logic fix also applies to the statistics function, `getPaymentQueueStats`. It ensures that the overview counts shown to the user will match the contents of the payment list, fixing the data inconsistency.
 
 ## Confluence Documentation References
 
-- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page provides the canonical end-to-end case lifecycle, including the critical 'Payments' phase. The ticket is about fixing the logic of how disputes and invoices interact within this workflow, specifically how a dispute's status changes from 'Pending Payment' when an invoice is created or deleted. This document defines the correct state transitions.
-- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — The ticket is a subtask of 'Organization Management' and deals with invoice/payment issues. This PRD explains that payment errors are a high-severity problem often caused by duplicate organization records. It provides critical architectural context, stating that banking information must be explicitly tied to a verified organization before payments can be processed. This informs the developer that any fix must align with this data integrity strategy.
-- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This document provides a thematic analysis of recurring bugs, highlighting that the 'Payments & Refunds Logic', 'Invoicing & Invoice Acknowledgement', and 'Organization & User Data Integrity' are all major 'pain points' and complexity hotspots. This is essential context for a developer, warning them that the area is fragile and that status transitions based on payments are a common source of production issues.
-- [Proposed Changes to Address Current Issues](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/246906881) — This page contains meeting notes that explicitly list 'Invoice System Fixes' and 'Data Normalization Needed' as key initiatives. This confirms for the developer that the ticket is part of a recognized, broader effort to correct systemic issues in the invoicing and payment process, providing strategic context for the bug fix.
-- [Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/296910852) — This document outlines the specific E2E testing workflow that QA uses to validate payment and invoice functionality. It describes the expected 'happy path' behavior, such as generating an invoice and confirming it appears in the 'Pending Invoice Acknowledgement' tab. This serves as a clear set of acceptance criteria for the developer's work.
+- [IDRE Worflow](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/284688394) — This page defines the canonical, end-to-end lifecycle for a dispute, including the "Payments" phase. The ticket describes a failure in this process, where disputes are not behaving consistently. This document provides the baseline business process and status transitions (e.g., "Pending Payment") that the developer must correctly implement.
+- [Product Requirements Document for IDRE Dispute Platform's Organization Management System](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/302383114) — The ticket's parent is "Organization Management," and this PRD explicitly states that flawed organization data is a root cause of "misdirected payments" and "workflow confusion." The developer needs to understand the planned architectural changes (e.g., parent/sub-organizations, explicit banking account binding) to ensure their fix for the invoicing logic aligns with the platform's strategic direction for data integrity.
+- [Bugs](https://orchidsoftware.atlassian.net/wiki/spaces/IDRE/pages/285736962) — This page provides critical context by identifying "Invoicing & Invoice Acknowledgement" and "Organization & User Data Integrity" as major sources of bugs and operational pain. It helps the developer understand the systemic risks and common failure patterns associated with the feature they are fixing, which is essential for developing a robust solution.
+- [Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team](https://orchidsoftware.atlassian.net/wiki/spaces/SD/pages/296910852) — This document outlines the expected "happy path" for the payment and invoicing workflow from a QA perspective. The ticket describes a scenario that deviates from this path. This provides the developer with a clear, step-by-step description of the functionality they need to restore, particularly around generating an invoice and having it appear correctly for acknowledgement.
 
 **Suggested Documentation Updates:**
 
-- IDRE Worflow: The ticket addresses the logic of how creating/deleting an invoice affects a dispute's status in the payment queue. This document outlines the canonical case lifecycle and status changes, and it should be updated to reflect the corrected, implemented behavior.
-- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team: This document's testing steps for the Payment & Party Portal will need to be updated to include specific checks for the behavior described in the ticket, such as verifying that deleting an invoice returns a dispute to the payment tab and that CSV and invoice downloads match.
+- IDRE Worflow
+- Pre-Staging Readiness and End-to-End Testing Workflow for Development and QA Team
 
 ## AI Confidence Scores
-Plan: 90%, Code: 100%
+Plan: 90%, Code: 95%, Tests: 95%
 
 ---
 > ⚠️ **This PR was generated by AI (Claude via AWS Bedrock) and requires thorough human review
